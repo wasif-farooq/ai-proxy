@@ -1,0 +1,94 @@
+version: "3.9"
+
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # ─── PostgreSQL ──────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    <<: *common
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_proxy}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── API Server ──────────────────────────────────────────
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.api
+    <<: *common
+    environment:
+      ENV: production
+      SERVICE_NAME: ai-proxy-api
+      SERVER_PORT: 8080
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-ai_proxy}?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: json
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://admin.example.com}
+      RATE_LIMIT_REQUESTS_PER_MIN: ${RATE_LIMIT_REQUESTS_PER_MIN:-60}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-10}
+    expose:
+      - "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ─── Admin Server ────────────────────────────────────────
+  admin:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.admin
+    <<: *common
+    environment:
+      ENV: production
+      SERVICE_NAME: ai-proxy-admin
+      SERVER_PORT: 8080
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-ai_proxy}?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: json
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://admin.example.com}
+    expose:
+      - "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ─── Nginx Reverse Proxy ─────────────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    <<: *common
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx-cache:/var/cache/nginx
+      - ssl-certs:/etc/nginx/ssl:ro
+    depends_on:
+      - api
+      - admin
+
+volumes:
+  pgdata:
+  nginx-cache:
+  ssl-certs:

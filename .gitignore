@@ -1,0 +1,41 @@
+# ─── Go ───────────────────────────────────────────────────
+build/
+*.exe
+*.test
+*.out
+/tmp/
+
+# ─── Frontend (Vite / React) ──────────────────────────────
+web/node_modules/
+web/dist/
+
+# ─── IDE and editor files ──────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.orig
+.vs/
+
+# ─── OS files ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ─── Environment files ─────────────────────────────────────
+.env
+.env.local
+.env.dev
+.env.prod
+!.env.example
+
+# ─── Logs ──────────────────────────────────────────────────
+*.log
+build-errors.log
+
+# ─── Docker ────────────────────────────────────────────────
+docker-data/
+
+# ─── Testing ──────────────────────────────────────────────
+test/tmp/

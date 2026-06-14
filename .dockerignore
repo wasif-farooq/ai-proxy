@@ -1,0 +1,35 @@
+# ─── Version control ───────────────────────────────────────
+.git
+.gitignore
+
+# ─── Build artifacts ───────────────────────────────────────
+tmp/
+tmp/*
+dist/
+*.out
+
+# ─── IDE and editor files ──────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ─── OS files ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Frontend ──────────────────────────────────────────────
+web/node_modules/
+web/dist/
+web/.next/
+web/.nuxt/
+
+# ─── Environment files ─────────────────────────────────────
+.env
+.env.*
+!.env.prod
+
+# ─── Logs ──────────────────────────────────────────────────
+*.log
+build-errors.log

@@ -1,0 +1,21 @@
+# =============================================================================
+# Development Dockerfile for ai-proxy
+#
+# Defaults to `go run` for simplicity. Swap to Air for hot-reload:
+#   docker compose run --entrypoint "air -c .air.toml" api
+# =============================================================================
+FROM golang:1.25-alpine AS dev
+
+RUN apk add --no-cache gcc musl-dev git curl
+
+# Install Air for hot reload
+RUN go install github.com/air-verse/air@latest
+
+WORKDIR /app
+
+# Pre-cache Go modules
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Default to API server; override CMD for admin
+CMD ["go", "run", "./cmd/api"]

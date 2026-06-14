@@ -1,0 +1,13 @@
+# =============================================================================
+# AI Proxy — Root-level Docker Compose
+#
+# This file is a convenience alias for the development stack.
+# The actual service definitions live in deployments/docker/.
+#
+# Usage:
+#   docker compose up -d          # Start dev stack
+#   docker compose down --volumes # Stop and clean up
+# =============================================================================
+
+include:
+  - deployments/docker/docker-compose.dev.yml

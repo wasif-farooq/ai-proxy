@@ -16,6 +16,7 @@ func (e *AppError) Error() string {
 // Common application errors.
 var (
 	ErrNotFound       = NewAppError(http.StatusNotFound, "Resource not found")
+	ErrBadGateway     = NewAppError(http.StatusBadGateway, "Bad gateway")
 	ErrUnauthorized   = NewAppError(http.StatusUnauthorized, "Unauthorized")
 	ErrForbidden      = NewAppError(http.StatusForbidden, "Forbidden")
 	ErrBadRequest     = NewAppError(http.StatusBadRequest, "Bad request")

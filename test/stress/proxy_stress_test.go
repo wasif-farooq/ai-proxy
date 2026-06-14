@@ -1236,6 +1236,809 @@ func TestProxyStressEncryptedAuth(t *testing.T) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// Test 5: Non-streaming stress test — File body with Bearer auth
+//   go test -tags=stress -v ./test/stress -run TestProxyStressFileBody -timeout 5m
+// ══════════════════════════════════════════════════════════════════════════
+
+func TestProxyStressFileBody(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	gin.SetMode(gin.ReleaseMode)
+	logger.Init(logger.Config{Level: "error", Format: "text", AddSource: false})
+
+	// ── 1. Start mock upstream ────────────────────────────────
+	upstreamHandler := &mockUpstreamHandler{
+		minLatency: 20 * time.Millisecond,
+		maxLatency: 80 * time.Millisecond,
+		failRate:   0.02,
+	}
+	mockUpstream := httptest.NewServer(upstreamHandler)
+	defer mockUpstream.Close()
+	t.Logf("Mock upstream provider running at: %s", mockUpstream.URL)
+
+	// ── 2. Set up dependencies ────────────────────────────────
+	clientRepo := &mockClientRepo{}
+	clientSvc := client.NewService(clientRepo, "stress-test-master-key")
+
+	providerRepo := &mockProviderRepo{upstreamURL: mockUpstream.URL}
+	providerReg := provider.NewRegistry(providerRepo)
+	if err := providerReg.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh registry: %v", err)
+	}
+
+	providerKeySvc := client.NewProviderKeyService(&mockKeyRepo{}, clientSvc, "stress-test-master-key")
+	proxy := provider.NewProxy(providerReg, providerKeySvc, 30*time.Second)
+
+	nonceStore := security.NewInMemoryNonceStore(5 * time.Minute)
+	rateLimiter := security.NewRateLimiter(100000, 10000)
+	defer rateLimiter.Stop()
+
+	// ── 3. Create Gin router ─────────────────────────────────
+	cfg := config.Load()
+	cfg.RateLimitRequestsPerMin = 100000
+	cfg.RateLimitBurst = 10000
+
+	router := shared.NewRouter(cfg)
+	api := router.Group("/api/v1")
+	api.POST("/chat/completions",
+		provider.DualAuthMiddleware(clientSvc, nonceStore, 5*time.Minute),
+		security.RateLimitMiddleware(rateLimiter),
+		provider.RouteMiddleware(proxy),
+	)
+
+	proxyServer := httptest.NewServer(router)
+	defer proxyServer.Close()
+	t.Logf("Proxy server running at: %s", proxyServer.URL)
+
+	// ── 4. Warm-up ───────────────────────────────────────────
+	t.Log("\n━━━ Warm-up (10 requests, file body) ━━━")
+	warmupMetrics := runStressTestFileBody(proxyServer.URL, 2, 5)
+	t.Log(warmupMetrics.report(2))
+	t.Log("Warm-up complete.\n")
+
+	// ── 5. Run all stress levels ─────────────────────────────
+	var allMetrics []*stressMetrics
+
+	for _, l := range stressLevels {
+		t.Logf("\n━━━ Running: %s (%d concurrent, %d req each, file body, Bearer auth) ━━━",
+			l.label, l.concurrency, l.perWorker)
+
+		metrics := runStressTestFileBody(proxyServer.URL, l.concurrency, l.perWorker)
+		t.Log(metrics.report(l.concurrency))
+		allMetrics = append(allMetrics, metrics)
+	}
+
+	// ── 6. Summary dashboard ─────────────────────────────────
+	t.Log("\n\n╔══════════════════════════════════════════════════════════════════╗")
+	t.Log("║   NON-STREAMING STRESS TEST — FILE BODY (BEARER AUTH)          ║")
+	t.Log("╚══════════════════════════════════════════════════════════════════╝")
+	t.Log()
+	t.Logf("Request body:         ~%d KB (base64 image + file_ids + JSON)", len(buildFileBodyJSON(false, ""))/1024)
+	t.Logf("Mock upstream latency: %s – %s (uniform random)", formatDur(20*time.Millisecond), formatDur(80*time.Millisecond))
+	t.Logf("Mock upstream failure:  2%%")
+	t.Logf("Auth method:            Bearer (client_secret)")
+	t.Logf("Middleware chain:       DualAuth (Bearer) → RateLimit → Route → Proxy → Forward")
+	t.Log()
+	for i, l := range stressLevels {
+		t.Logf("── Level %d: %s (%d concurrent) ──", i+1, l.label, l.concurrency)
+		t.Log(allMetrics[i].report(l.concurrency))
+	}
+	t.Log()
+	t.Log("Dashboard summary:")
+	t.Log("────────────────────────────────────────────────────────────────")
+	t.Log("Level    Concurrency    Throughput     p50        p99        Errors")
+	t.Log("────────────────────────────────────────────────────────────────")
+	for i, l := range stressLevels {
+		m := allMetrics[i]
+		bar := ""
+		maxRps := 1000.0
+		barLen := int(m.rps() / maxRps * 20)
+		if barLen > 20 {
+			barLen = 20
+		} else if barLen < 1 {
+			barLen = 1
+		}
+		for j := 0; j < barLen; j++ {
+			bar += "█"
+		}
+		t.Logf("  %d  │  %3d concurrent  │  %8.1f/s   │ %7s  │ %7s  │ %3d (%4.1f%%)   %s",
+			i+1, l.concurrency, m.rps(),
+			formatDur(m.p50()), formatDur(m.p99()),
+			m.failures, pct(m.failures, m.total()),
+			bar)
+	}
+	t.Log("────────────────────────────────────────────────────────────────")
+	t.Log()
+	t.Log("══════════════════════════════════════════════════════════════════")
+	t.Log("  FILE BODY (BEARER) STRESS TEST COMPLETE")
+	t.Log("══════════════════════════════════════════════════════════════════")
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test 6: Streaming stress test — File body with Bearer auth
+//   go test -tags=stress -v ./test/stress -run TestProxyStreamingStressFileBody -timeout 5m
+// ══════════════════════════════════════════════════════════════════════════
+
+func TestProxyStreamingStressFileBody(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	gin.SetMode(gin.ReleaseMode)
+	logger.Init(logger.Config{Level: "error", Format: "text", AddSource: false})
+
+	// ── 1. Start mock SSE upstream ───────────────────────────
+	sseHandler := &mockSSEUpstreamHandler{
+		initialLatency: 20 * time.Millisecond,
+		chunkCount:     11,
+		chunkInterval:  5 * time.Millisecond,
+		failRate:       0.02,
+	}
+	mockUpstream := httptest.NewServer(sseHandler)
+	defer mockUpstream.Close()
+	t.Logf("Mock SSE upstream running at: %s", mockUpstream.URL)
+
+	// ── 2. Set up deps ───────────────────────────────────────
+	clientRepo := &mockClientRepo{}
+	clientSvc := client.NewService(clientRepo, "stress-test-master-key")
+
+	providerRepo := &mockProviderRepo{upstreamURL: mockUpstream.URL}
+	providerReg := provider.NewRegistry(providerRepo)
+	if err := providerReg.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh registry: %v", err)
+	}
+
+	providerKeySvc := client.NewProviderKeyService(&mockKeyRepo{}, clientSvc, "stress-test-master-key")
+	proxy := provider.NewProxy(providerReg, providerKeySvc, 60*time.Second)
+
+	nonceStore := security.NewInMemoryNonceStore(5 * time.Minute)
+	rateLimiter := security.NewRateLimiter(100000, 10000)
+	defer rateLimiter.Stop()
+
+	// ── 3. Gin router ────────────────────────────────────────
+	cfg := config.Load()
+	cfg.RateLimitRequestsPerMin = 100000
+	cfg.RateLimitBurst = 10000
+
+	router := shared.NewRouter(cfg)
+	api := router.Group("/api/v1")
+	api.POST("/chat/completions",
+		provider.DualAuthMiddleware(clientSvc, nonceStore, 5*time.Minute),
+		security.RateLimitMiddleware(rateLimiter),
+		provider.RouteMiddleware(proxy),
+	)
+
+	proxyServer := httptest.NewServer(router)
+	defer proxyServer.Close()
+	t.Logf("Proxy server running at: %s", proxyServer.URL)
+
+	// ── 4. Warm-up ───────────────────────────────────────────
+	t.Log("\n━━━ SSE Warm-up (6 requests, file body) ━━━")
+	warmupMetrics := runStreamingStressTestFileBody(proxyServer.URL, 2, 3)
+	t.Log(warmupMetrics.reportStream(2))
+	t.Log("Warm-up complete.\n")
+
+	// ── 5. Run all streaming stress levels ──────────────────
+	var allMetrics []*streamingMetrics
+
+	for _, l := range streamingLevels {
+		t.Logf("\n━━━ SSE: %s (%d concurrent, %d req each, file body, Bearer auth) ━━━",
+			l.label, l.concurrency, l.perWorker)
+
+		metrics := runStreamingStressTestFileBody(proxyServer.URL, l.concurrency, l.perWorker)
+		t.Log(metrics.reportStream(l.concurrency))
+		allMetrics = append(allMetrics, metrics)
+	}
+
+	// ── 6. Summary dashboard ─────────────────────────────────
+	t.Log("\n\n╔══════════════════════════════════════════════════════════════════╗")
+	t.Log("║      STREAMING STRESS TEST — FILE BODY (BEARER AUTH)            ║")
+	t.Log("╚══════════════════════════════════════════════════════════════════╝")
+	t.Log()
+	t.Log("Mock SSE upstream:")
+	t.Logf("  Initial latency:  %s", formatDur(sseHandler.initialLatency))
+	t.Logf("  Chunks:           %d × %s interval", sseHandler.chunkCount, formatDur(sseHandler.chunkInterval))
+	t.Logf("  Total stream:     ~%s", formatDur(sseHandler.initialLatency+time.Duration(sseHandler.chunkCount)*sseHandler.chunkInterval))
+	t.Logf("  Request body:      ~%d KB (base64 image + file_ids + JSON)", len(buildFileBodyJSON(true, ""))/1024)
+	t.Log("Auth method:        Bearer (client_secret)")
+	t.Log("Middleware chain:   DualAuth (Bearer) → RateLimit → Route → Proxy → ForwardStreaming")
+	t.Log()
+
+	t.Log("Per-level reports:")
+	for i, l := range streamingLevels {
+		t.Logf("── Level %d: %s (%d concurrent) ──", i+1, l.label, l.concurrency)
+		t.Log(allMetrics[i].reportStream(l.concurrency))
+	}
+
+	t.Log()
+	t.Log("Streaming dashboard:")
+	t.Log("─────────────────────────────────────────────────────────────────────────────")
+	t.Log("Lvl  Concurrency   Throughput    TTFC p50   TTFC p99   Total p99   Errors")
+	t.Log("─────────────────────────────────────────────────────────────────────────────")
+	for i, l := range streamingLevels {
+		m := allMetrics[i]
+		t.Logf(" %2d     %3d          %7.1f/s     %8s    %8s    %8s    %3d (%4.1f%%)",
+			i+1, l.concurrency, m.rps(),
+			formatDur(m.ttfcPercentile(50)), formatDur(m.ttfcPercentile(99)),
+			formatDur(m.p99()),
+			m.failures, pct(m.failures, m.total()))
+	}
+	t.Log("─────────────────────────────────────────────────────────────────────────────")
+	t.Log()
+	t.Log("══════════════════════════════════════════════════════════════════")
+	t.Log("  FILE BODY (BEARER) STREAMING STRESS TEST COMPLETE")
+	t.Log("══════════════════════════════════════════════════════════════════")
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test 7: Non-streaming stress test — File body with X-Auth encrypted auth
+//   go test -tags=stress -v ./test/stress -run TestProxyStressFileBodyEncrypted -timeout 5m
+// ══════════════════════════════════════════════════════════════════════════
+
+func TestProxyStressFileBodyEncrypted(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	gin.SetMode(gin.ReleaseMode)
+	logger.Init(logger.Config{Level: "error", Format: "text", AddSource: false})
+
+	// ── 1. Start mock upstream ────────────────────────────────
+	upstreamHandler := &mockUpstreamHandler{
+		minLatency: 20 * time.Millisecond,
+		maxLatency: 80 * time.Millisecond,
+		failRate:   0.02,
+	}
+	mockUpstream := httptest.NewServer(upstreamHandler)
+	defer mockUpstream.Close()
+	t.Logf("Mock upstream provider running at: %s", mockUpstream.URL)
+
+	// ── 2. Set up dependencies ────────────────────────────────
+	clientRepo := &mockClientRepo{}
+	clientSvc := client.NewService(clientRepo, "stress-test-master-key")
+
+	providerRepo := &mockProviderRepo{upstreamURL: mockUpstream.URL}
+	providerReg := provider.NewRegistry(providerRepo)
+	if err := providerReg.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh registry: %v", err)
+	}
+
+	providerKeySvc := client.NewProviderKeyService(&mockKeyRepo{}, clientSvc, "stress-test-master-key")
+	proxy := provider.NewProxy(providerReg, providerKeySvc, 30*time.Second)
+
+	nonceStore := security.NewInMemoryNonceStore(5 * time.Minute)
+	rateLimiter := security.NewRateLimiter(100000, 10000)
+	defer rateLimiter.Stop()
+
+	// ── 3. Create Gin router with DualAuthMiddleware ──────────
+	cfg := config.Load()
+	cfg.RateLimitRequestsPerMin = 100000
+	cfg.RateLimitBurst = 10000
+
+	router := shared.NewRouter(cfg)
+	api := router.Group("/api/v1")
+	api.POST("/chat/completions",
+		provider.DualAuthMiddleware(clientSvc, nonceStore, 5*time.Minute),
+		security.RateLimitMiddleware(rateLimiter),
+		provider.RouteMiddleware(proxy),
+	)
+
+	proxyServer := httptest.NewServer(router)
+	defer proxyServer.Close()
+	t.Logf("Proxy server running at: %s", proxyServer.URL)
+
+	// ── 4. Warm-up ───────────────────────────────────────────
+	t.Log("\n━━━ Warm-up (10 requests, file body, X-Auth) ━━━")
+	warmupMetrics := runStressTestFileBodyEncrypted(proxyServer.URL, 2, 5)
+	t.Log(warmupMetrics.report(2))
+	t.Log("Warm-up complete.\n")
+
+	// ── 5. Run all stress levels ─────────────────────────────
+	var allMetrics []*stressMetrics
+
+	for _, l := range stressLevels {
+		t.Logf("\n━━━ Running: %s (%d concurrent, %d req each, file body, X-Auth auth) ━━━",
+			l.label, l.concurrency, l.perWorker)
+
+		metrics := runStressTestFileBodyEncrypted(proxyServer.URL, l.concurrency, l.perWorker)
+		t.Log(metrics.report(l.concurrency))
+		allMetrics = append(allMetrics, metrics)
+	}
+
+	// ── 6. Summary dashboard ─────────────────────────────────
+	t.Log("\n\n╔══════════════════════════════════════════════════════════════════╗")
+	t.Log("║ NON-STREAMING STRESS TEST — FILE BODY (X-AUTH ENCRYPTED AUTH)  ║")
+	t.Log("╚══════════════════════════════════════════════════════════════════╝")
+	t.Log()
+	t.Logf("Request body:         ~%d KB (base64 image + file_ids + JSON)", len(buildFileBodyJSON(false, ""))/1024)
+	t.Logf("Mock upstream latency: %s – %s (uniform random)", formatDur(20*time.Millisecond), formatDur(80*time.Millisecond))
+	t.Logf("Mock upstream failure:  2%%")
+	t.Logf("Auth method:            X-Auth (AES-GCM encrypted payload)")
+	t.Logf("Middleware chain:       DualAuth (encrypted) → RateLimit → Route → Proxy → Forward")
+	t.Log()
+	for i, l := range stressLevels {
+		t.Logf("── Level %d: %s (%d concurrent) ──", i+1, l.label, l.concurrency)
+		t.Log(allMetrics[i].report(l.concurrency))
+	}
+	t.Log()
+	t.Log("Dashboard summary:")
+	t.Log("────────────────────────────────────────────────────────────────")
+	t.Log("Level    Concurrency    Throughput     p50        p99        Errors")
+	t.Log("────────────────────────────────────────────────────────────────")
+	for i, l := range stressLevels {
+		m := allMetrics[i]
+		bar := ""
+		rps := m.rps()
+		maxRps := 1000.0
+		barLen := int(rps / maxRps * 20)
+		if barLen > 20 {
+			barLen = 20
+		} else if barLen < 1 {
+			barLen = 1
+		}
+		for j := 0; j < barLen; j++ {
+			bar += "█"
+		}
+		t.Logf("  %d  │  %3d concurrent  │  %8.1f/s   │ %7s  │ %7s  │ %3d (%4.1f%%)   %s",
+			i+1, l.concurrency, rps,
+			formatDur(m.p50()), formatDur(m.p99()),
+			m.failures, pct(m.failures, m.total()),
+			bar)
+	}
+	t.Log("────────────────────────────────────────────────────────────────")
+	t.Log()
+	t.Log("══════════════════════════════════════════════════════════════════")
+	t.Log("  FILE BODY (X-AUTH) STRESS TEST COMPLETE")
+	t.Log("══════════════════════════════════════════════════════════════════")
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test 8: Streaming stress test — File body with X-Auth encrypted auth
+//   go test -tags=stress -v ./test/stress -run TestProxyStreamingStressFileBodyEncrypted -timeout 5m
+// ══════════════════════════════════════════════════════════════════════════
+
+func TestProxyStreamingStressFileBodyEncrypted(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	gin.SetMode(gin.ReleaseMode)
+	logger.Init(logger.Config{Level: "error", Format: "text", AddSource: false})
+
+	// ── 1. Start mock SSE upstream ───────────────────────────
+	sseHandler := &mockSSEUpstreamHandler{
+		initialLatency: 20 * time.Millisecond,
+		chunkCount:     11,
+		chunkInterval:  5 * time.Millisecond,
+		failRate:       0.02,
+	}
+	mockUpstream := httptest.NewServer(sseHandler)
+	defer mockUpstream.Close()
+	t.Logf("Mock SSE upstream running at: %s", mockUpstream.URL)
+
+	// ── 2. Set up deps ───────────────────────────────────────
+	clientRepo := &mockClientRepo{}
+	clientSvc := client.NewService(clientRepo, "stress-test-master-key")
+
+	providerRepo := &mockProviderRepo{upstreamURL: mockUpstream.URL}
+	providerReg := provider.NewRegistry(providerRepo)
+	if err := providerReg.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh registry: %v", err)
+	}
+
+	providerKeySvc := client.NewProviderKeyService(&mockKeyRepo{}, clientSvc, "stress-test-master-key")
+	proxy := provider.NewProxy(providerReg, providerKeySvc, 60*time.Second)
+
+	nonceStore := security.NewInMemoryNonceStore(5 * time.Minute)
+	rateLimiter := security.NewRateLimiter(100000, 10000)
+	defer rateLimiter.Stop()
+
+	// ── 3. Gin router with DualAuthMiddleware ────────────────
+	cfg := config.Load()
+	cfg.RateLimitRequestsPerMin = 100000
+	cfg.RateLimitBurst = 10000
+
+	router := shared.NewRouter(cfg)
+	api := router.Group("/api/v1")
+	api.POST("/chat/completions",
+		provider.DualAuthMiddleware(clientSvc, nonceStore, 5*time.Minute),
+		security.RateLimitMiddleware(rateLimiter),
+		provider.RouteMiddleware(proxy),
+	)
+
+	proxyServer := httptest.NewServer(router)
+	defer proxyServer.Close()
+	t.Logf("Proxy server running at: %s", proxyServer.URL)
+
+	// ── 4. Warm-up ───────────────────────────────────────────
+	t.Log("\n━━━ SSE Warm-up (6 requests, file body, X-Auth) ━━━")
+	warmupMetrics := runStreamingStressTestFileBodyEncrypted(proxyServer.URL, 2, 3)
+	t.Log(warmupMetrics.reportStream(2))
+	t.Log("Warm-up complete.\n")
+
+	// ── 5. Run all streaming stress levels ──────────────────
+	var allMetrics []*streamingMetrics
+
+	for _, l := range streamingLevels {
+		t.Logf("\n━━━ SSE: %s (%d concurrent, %d req each, file body, X-Auth auth) ━━━",
+			l.label, l.concurrency, l.perWorker)
+
+		metrics := runStreamingStressTestFileBodyEncrypted(proxyServer.URL, l.concurrency, l.perWorker)
+		t.Log(metrics.reportStream(l.concurrency))
+		allMetrics = append(allMetrics, metrics)
+	}
+
+	// ── 6. Summary dashboard ─────────────────────────────────
+	t.Log("\n\n╔══════════════════════════════════════════════════════════════════╗")
+	t.Log("║  STREAMING STRESS TEST — FILE BODY (X-AUTH ENCRYPTED AUTH)     ║")
+	t.Log("╚══════════════════════════════════════════════════════════════════╝")
+	t.Log()
+	t.Log("Mock SSE upstream:")
+	t.Logf("  Initial latency:  %s", formatDur(sseHandler.initialLatency))
+	t.Logf("  Chunks:           %d × %s interval", sseHandler.chunkCount, formatDur(sseHandler.chunkInterval))
+	t.Logf("  Total stream:     ~%s", formatDur(sseHandler.initialLatency+time.Duration(sseHandler.chunkCount)*sseHandler.chunkInterval))
+	t.Logf("  Request body:      ~%d KB (base64 image + file_ids + JSON)", len(buildFileBodyJSON(true, ""))/1024)
+	t.Log("Auth method:        X-Auth (AES-GCM encrypted payload)")
+	t.Log("Middleware chain:   DualAuth (encrypted) → RateLimit → Route → Proxy → ForwardStreaming")
+	t.Log()
+
+	t.Log("Per-level reports:")
+	for i, l := range streamingLevels {
+		t.Logf("── Level %d: %s (%d concurrent) ──", i+1, l.label, l.concurrency)
+		t.Log(allMetrics[i].reportStream(l.concurrency))
+	}
+
+	t.Log()
+	t.Log("Streaming dashboard:")
+	t.Log("─────────────────────────────────────────────────────────────────────────────")
+	t.Log("Lvl  Concurrency   Throughput    TTFC p50   TTFC p99   Total p99   Errors")
+	t.Log("─────────────────────────────────────────────────────────────────────────────")
+	for i, l := range streamingLevels {
+		m := allMetrics[i]
+		t.Logf(" %2d     %3d          %7.1f/s     %8s    %8s    %8s    %3d (%4.1f%%)",
+			i+1, l.concurrency, m.rps(),
+			formatDur(m.ttfcPercentile(50)), formatDur(m.ttfcPercentile(99)),
+			formatDur(m.p99()),
+			m.failures, pct(m.failures, m.total()))
+	}
+	t.Log("─────────────────────────────────────────────────────────────────────────────")
+	t.Log()
+	t.Log("══════════════════════════════════════════════════════════════════")
+	t.Log("  FILE BODY (X-AUTH) STREAMING STRESS TEST COMPLETE")
+	t.Log("══════════════════════════════════════════════════════════════════")
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// File-based request body payload (simulates a vision-style file reference)
+// ══════════════════════════════════════════════════════════════════════════
+
+// fileBodyJSON is a realistic chat completion body with base64-encoded file
+// content and file_ids. The base64 string is ~1500 chars of synthetic data
+// to simulate a real file attachment, resulting in a ~2KB request body.
+var fileBodyBase64 string
+
+func init() {
+	// Generate synthetic base64 content to simulate a file attachment
+	var buf bytes.Buffer
+	for i := 0; i < 200; i++ {
+		buf.WriteString("This is sample file content for stress testing the AI Proxy. ")
+	}
+	fileBodyBase64 = base64.RawStdEncoding.EncodeToString(buf.Bytes())
+}
+
+func buildFileBodyJSON(stream bool, fileID string) string {
+	streamStr := "false"
+	if stream {
+		streamStr = "true"
+	}
+	// Escape any characters that could break JSON
+	return fmt.Sprintf(`{
+  "model": "gpt-4o",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Analyze this file: %s"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,%s"}}
+      ]
+    }
+  ],
+  "stream": %s,
+  "file_ids": ["%s"]
+}`, fileID, fileBodyBase64, streamStr, fileID)
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// File body: non-streaming stress test runner (Bearer auth)
+// ══════════════════════════════════════════════════════════════════════════
+
+func runStressTestFileBody(serverURL string, concurrency, requestsPerWorker int) *stressMetrics {
+	metrics := newStressMetrics()
+	metrics.startTime = time.Now()
+
+	var nonceCounter uint64
+	var wg sync.WaitGroup
+
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			client := &http.Client{
+				Timeout: 30 * time.Second,
+				Transport: &http.Transport{
+					MaxIdleConnsPerHost: 100,
+					MaxIdleConns:        200,
+				},
+			}
+
+			for i := 0; i < requestsPerWorker; i++ {
+				nonce := fmt.Sprintf("file-body-%d-%d-%d", workerID, i, atomic.AddUint64(&nonceCounter, 1))
+				now := time.Now().Unix()
+				fileID := fmt.Sprintf("file-stress-%d-%d-%d", workerID, i, atomic.LoadUint64(&nonceCounter))
+				body := buildFileBodyJSON(false, fileID)
+
+				req, err := http.NewRequest("POST", serverURL+"/api/v1/chat/completions",
+					bytes.NewReader([]byte(body)))
+				if err != nil {
+					metrics.record(0, 500)
+					continue
+				}
+
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-Client-ID", testClientID)
+				req.Header.Set("Authorization", "Bearer "+testClientSecret)
+				req.Header.Set("X-Nonce", nonce)
+				req.Header.Set("X-Timestamp", fmt.Sprintf("%d", now))
+
+				start := time.Now()
+				resp, err := client.Do(req)
+				latency := time.Since(start)
+
+				if err != nil {
+					metrics.record(latency, 500)
+					continue
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				metrics.record(latency, resp.StatusCode)
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	metrics.endTime = time.Now()
+
+	return metrics
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// File body: streaming stress test runner (Bearer auth)
+// ══════════════════════════════════════════════════════════════════════════
+
+func runStreamingStressTestFileBody(serverURL string, concurrency, requestsPerWorker int) *streamingMetrics {
+	metrics := newStreamingMetrics()
+	metrics.stressMetrics.startTime = time.Now()
+
+	var nonceCounter uint64
+	var wg sync.WaitGroup
+
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			client := &http.Client{
+				Timeout: 60 * time.Second,
+				Transport: &http.Transport{
+					MaxIdleConnsPerHost: 100,
+					MaxIdleConns:        200,
+				},
+			}
+
+			for i := 0; i < requestsPerWorker; i++ {
+				nonce := fmt.Sprintf("file-body-sse-%d-%d-%d", workerID, i, atomic.AddUint64(&nonceCounter, 1))
+				now := time.Now().Unix()
+				fileID := fmt.Sprintf("file-stress-%d-%d-%d", workerID, i, atomic.LoadUint64(&nonceCounter))
+				body := buildFileBodyJSON(true, fileID)
+
+				req, err := http.NewRequest("POST", serverURL+"/api/v1/chat/completions",
+					bytes.NewReader([]byte(body)))
+				if err != nil {
+					metrics.stressMetrics.record(0, 500)
+					continue
+				}
+
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-Client-ID", testClientID)
+				req.Header.Set("Authorization", "Bearer "+testClientSecret)
+				req.Header.Set("X-Nonce", nonce)
+				req.Header.Set("X-Timestamp", fmt.Sprintf("%d", now))
+
+				start := time.Now()
+				resp, err := client.Do(req)
+				if err != nil {
+					totalLatency := time.Since(start)
+					metrics.recordStream(totalLatency, totalLatency, 500, 0, false)
+					continue
+				}
+
+				var firstChunkLatency time.Duration
+				var totalBytes int64
+				firstChunk := true
+				verified := false
+				buf := make([]byte, 4096)
+
+				for {
+					n, readErr := resp.Body.Read(buf)
+					if n > 0 {
+						totalBytes += int64(n)
+						if firstChunk {
+							firstChunkLatency = time.Since(start)
+							firstChunk = false
+						}
+						if strings.Contains(string(buf[:n]), "[DONE]") {
+							verified = true
+						}
+					}
+					if readErr != nil {
+						break
+					}
+				}
+				resp.Body.Close()
+
+				totalLatency := time.Since(start)
+				metrics.recordStream(firstChunkLatency, totalLatency, resp.StatusCode, totalBytes, verified)
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	metrics.stressMetrics.endTime = time.Now()
+
+	return metrics
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// File body: non-streaming stress test runner (X-Auth encrypted auth)
+// ══════════════════════════════════════════════════════════════════════════
+
+func runStressTestFileBodyEncrypted(serverURL string, concurrency, requestsPerWorker int) *stressMetrics {
+	metrics := newStressMetrics()
+	metrics.startTime = time.Now()
+
+	var nonceCounter uint64
+	var wg sync.WaitGroup
+
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			client := &http.Client{
+				Timeout: 30 * time.Second,
+				Transport: &http.Transport{
+					MaxIdleConnsPerHost: 100,
+					MaxIdleConns:        200,
+				},
+			}
+
+			for i := 0; i < requestsPerWorker; i++ {
+				nonce := fmt.Sprintf("xauth-file-%d-%d-%d", workerID, i, atomic.AddUint64(&nonceCounter, 1))
+				now := time.Now().Unix()
+				xAuth := buildXAuthHeader(testClientID, testEncryptionKey, nonce, now)
+				fileID := fmt.Sprintf("file-stress-%d-%d-%d", workerID, i, atomic.LoadUint64(&nonceCounter))
+				body := buildFileBodyJSON(false, fileID)
+
+				req, err := http.NewRequest("POST", serverURL+"/api/v1/chat/completions",
+					bytes.NewReader([]byte(body)))
+				if err != nil {
+					metrics.record(0, 500)
+					continue
+				}
+
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-Client-ID", testClientID)
+				req.Header.Set("X-Auth", xAuth)
+
+				start := time.Now()
+				resp, err := client.Do(req)
+				latency := time.Since(start)
+
+				if err != nil {
+					metrics.record(latency, 500)
+					continue
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				metrics.record(latency, resp.StatusCode)
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	metrics.endTime = time.Now()
+
+	return metrics
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// File body: streaming stress test runner (X-Auth encrypted auth)
+// ══════════════════════════════════════════════════════════════════════════
+
+func runStreamingStressTestFileBodyEncrypted(serverURL string, concurrency, requestsPerWorker int) *streamingMetrics {
+	metrics := newStreamingMetrics()
+	metrics.stressMetrics.startTime = time.Now()
+
+	var nonceCounter uint64
+	var wg sync.WaitGroup
+
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			client := &http.Client{
+				Timeout: 60 * time.Second,
+				Transport: &http.Transport{
+					MaxIdleConnsPerHost: 100,
+					MaxIdleConns:        200,
+				},
+			}
+
+			for i := 0; i < requestsPerWorker; i++ {
+				nonce := fmt.Sprintf("xauth-file-sse-%d-%d-%d", workerID, i, atomic.AddUint64(&nonceCounter, 1))
+				now := time.Now().Unix()
+				xAuth := buildXAuthHeader(testClientID, testEncryptionKey, nonce, now)
+				fileID := fmt.Sprintf("file-stress-%d-%d-%d", workerID, i, atomic.LoadUint64(&nonceCounter))
+				body := buildFileBodyJSON(true, fileID)
+
+				req, err := http.NewRequest("POST", serverURL+"/api/v1/chat/completions",
+					bytes.NewReader([]byte(body)))
+				if err != nil {
+					metrics.stressMetrics.record(0, 500)
+					continue
+				}
+
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-Client-ID", testClientID)
+				req.Header.Set("X-Auth", xAuth)
+
+				start := time.Now()
+				resp, err := client.Do(req)
+				if err != nil {
+					totalLatency := time.Since(start)
+					metrics.recordStream(totalLatency, totalLatency, 500, 0, false)
+					continue
+				}
+
+				var firstChunkLatency time.Duration
+				var totalBytes int64
+				firstChunk := true
+				verified := false
+				buf := make([]byte, 4096)
+
+				for {
+					n, readErr := resp.Body.Read(buf)
+					if n > 0 {
+						totalBytes += int64(n)
+						if firstChunk {
+							firstChunkLatency = time.Since(start)
+							firstChunk = false
+						}
+						if strings.Contains(string(buf[:n]), "[DONE]") {
+							verified = true
+						}
+					}
+					if readErr != nil {
+						break
+					}
+				}
+				resp.Body.Close()
+
+				totalLatency := time.Since(start)
+				metrics.recordStream(firstChunkLatency, totalLatency, resp.StatusCode, totalBytes, verified)
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	metrics.stressMetrics.endTime = time.Now()
+
+	return metrics
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // Test 4: Streaming stress test — Encrypted X-Auth path
 //   go test -tags=stress -v ./test/stress -run TestProxyStreamingStressEncryptedAuth -timeout 5m
 // ══════════════════════════════════════════════════════════════════════════

@@ -40,6 +40,11 @@ func main() {
 			security.RateLimitMiddleware(rateLimiter),
 			provider.RouteMiddleware(proxy),
 		)
+		api.POST("/files",
+			provider.DualAuthMiddleware(deps.ClientSvc, nonceStore, 5*time.Minute),
+			security.RateLimitMiddleware(rateLimiter),
+			provider.FileUploadMiddleware(proxy),
+		)
 	}
 
 	// ─── HTTP server ──────────────────────────────────────

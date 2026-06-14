@@ -36,8 +36,7 @@ func main() {
 	api := router.Group("/api/v1")
 	{
 		api.POST("/chat/completions",
-			provider.AuthMiddleware(deps.ClientSvc),
-			security.NonceMiddleware(nonceStore, 5*time.Minute),
+			provider.DualAuthMiddleware(deps.ClientSvc, nonceStore, 5*time.Minute),
 			security.RateLimitMiddleware(rateLimiter),
 			provider.RouteMiddleware(proxy),
 		)

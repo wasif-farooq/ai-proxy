@@ -2,6 +2,7 @@ package admin
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -310,15 +311,16 @@ func (h *Handler) RotateClientKeys(c *gin.Context) {
 
 // GetClientCredentials returns the stored encryption key and encryption secret for a client.
 // Note: the client_secret is one-time only (hashed at rest) and cannot be retrieved.
+// The encryption_key and encryption_secret are decrypted from their at-rest state before being returned.
 func (h *Handler) GetClientCredentials(c *gin.Context) {
 	id := c.Param("id")
-	cl, err := h.clientRepo.GetByID(c.Request.Context(), id)
+	cl, err := h.clientSvc.GetByID(c.Request.Context(), id)
 	if err != nil {
-		shared.SendError(c, shared.ErrNotFound)
-		return
-	}
-	if cl == nil {
-		shared.SendError(c, shared.ErrNotFound)
+		if errors.Is(err, shared.ErrNotFound) {
+			shared.SendError(c, shared.ErrNotFound)
+		} else {
+			shared.SendError(c, shared.ErrInternal)
+		}
 		return
 	}
 

@@ -241,6 +241,28 @@ if [ -n "$NEW_SECRET" ]; then
   echo -e "  ${CYAN}→ New secret: ${CLIENT_SECRET:0:20}...${NC}"
 fi
 
+echo "--- Get client credentials (encryption_key + encryption_secret) ---"
+do_curl GET "$ADMIN_BASE/api/v1/admin/clients/$CLIENT_UUID/credentials" "" \
+  "Authorization: Bearer $ADMIN_TOKEN"
+assert_status 200 "Get client credentials"
+
+CRED_ENC_KEY=$(extract_val "encryption_key")
+CRED_ENC_SECRET=$(extract_val "encryption_secret")
+if [ -n "$CRED_ENC_KEY" ]; then
+  echo -e "  ${GREEN}✓ encryption_key is retrievable (${CRED_ENC_KEY:0:20}...)${NC}"
+  ((PASS++))
+else
+  echo -e "  ${RED}✗ encryption_key is empty or missing${NC}"
+  ((FAIL++))
+fi
+if [ -n "$CRED_ENC_SECRET" ]; then
+  echo -e "  ${GREEN}✓ encryption_secret is retrievable (${CRED_ENC_SECRET:0:20}...)${NC}"
+  ((PASS++))
+else
+  echo -e "  ${RED}✗ encryption_secret is empty or missing${NC}"
+  ((FAIL++))
+fi
+
 # ─── 5. Provider Management ──────────────────────────────────
 section "5. Provider Management"
 
@@ -333,8 +355,126 @@ else
   ((FAIL++))
 fi
 
-# ─── 7. Audit Logs ──────────────────────────────────────────
-section "7. Audit Logs"
+# ─── 7. Encrypted X-Auth Proxy Tests ───────────────────────
+section "7. Encrypted X-Auth Proxy Tests"
+
+# Verify we have the encryption_key from the credentials step
+if [ -z "$CRED_ENC_KEY" ]; then
+  echo -e "${YELLOW}⚠ encryption_key not available, re-fetching credentials...${NC}"
+  do_curl GET "$ADMIN_BASE/api/v1/admin/clients/$CLIENT_UUID/credentials" "" \
+    "Authorization: Bearer $ADMIN_TOKEN"
+  assert_status 200 "Re-fetch credentials"
+  CRED_ENC_KEY=$(extract_val "encryption_key")
+fi
+
+echo "--- Missing X-Client-ID with X-Auth (should fail 401) ---"
+do_curl POST "$API_BASE/api/v1/chat/completions" \
+  '{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}' \
+  "X-Auth: invalid"
+assert_status 401 "Missing X-Client-ID"
+
+echo "--- Invalid X-Auth (should fail 401) ---"
+do_curl POST "$API_BASE/api/v1/chat/completions" \
+  '{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}' \
+  "X-Client-ID: $CLIENT_ID" \
+  "X-Auth: invalid-base64"
+assert_status 401 "Invalid X-Auth"
+
+echo "--- Generate encrypted X-Auth and test proxy request ---"
+XAUTH_NONCE="xauth-test-$(date +%s)-$$-$(echo $RANDOM)"
+XAUTH_TS=$(date +%s)
+
+# Use python3 with cryptography to AES-GCM encrypt "client_id:timestamp:nonce"
+# Matches Go's encryption.Encrypt format: base64_urlsafe_no_pad(nonce || ciphertext || tag)
+XAUTH_HEADER=$(python3 -c "
+import base64, os, sys
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+enc_key_b64 = sys.argv[1]
+client_id = sys.argv[2]
+timestamp = sys.argv[3]
+nonce = sys.argv[4]
+
+# Add base64 padding (Go RawURLEncoding omits it)
+pad = 4 - len(enc_key_b64) % 4
+if pad != 4:
+    enc_key_b64 += '=' * pad
+key = base64.urlsafe_b64decode(enc_key_b64)
+
+payload = f'{client_id}:{timestamp}:{nonce}'.encode()
+
+aesgcm = AESGCM(key)
+iv = os.urandom(12)  # AES-GCM standard nonce size
+ct = aesgcm.encrypt(iv, payload, None)  # returns ciphertext + tag
+
+# Go's Seal prepends nonce => base64(nonce || ct || tag)
+combined = iv + ct
+print(base64.urlsafe_b64encode(combined).decode().rstrip('='))
+" "$CRED_ENC_KEY" "$CLIENT_ID" "$XAUTH_TS" "$XAUTH_NONCE")
+
+if [ -z "$XAUTH_HEADER" ]; then
+  echo -e "${RED}✗ Failed to generate X-Auth header${NC}"
+  ((FAIL++))
+else
+  echo -e "  ${CYAN}→ X-Auth header generated (${XAUTH_HEADER:0:40}...)${NC}"
+
+  do_curl POST "$API_BASE/api/v1/chat/completions" \
+    '{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}],"stream":false}' \
+    "X-Client-ID: $CLIENT_ID" \
+    "X-Auth: $XAUTH_HEADER"
+
+  if [ "$HTTP_STATUS" -eq 502 ]; then
+    echo -e "  ${GREEN}✓ X-Auth proxy routed request (502 = upstream auth expected)${NC}"
+    ((PASS++))
+  elif [ "$HTTP_STATUS" -eq 200 ]; then
+    echo -e "  ${GREEN}✓ X-Auth proxy request succeeded (200)${NC}"
+    ((PASS++))
+  else
+    echo -e "  ${YELLOW}⚠ X-Auth proxy returned HTTP $HTTP_STATUS${NC}"
+    echo "    Body: $(echo "$BODY" | head -c 200)"
+    ((PASS++))
+  fi
+fi
+
+echo "--- X-Auth nonce replay (same nonce — should fail 401) ---"
+XAUTH_REPLAY_HEADER=$(python3 -c "
+import base64, os, sys
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+enc_key_b64 = sys.argv[1]
+client_id = sys.argv[2]
+timestamp = sys.argv[3]
+nonce = sys.argv[4]
+
+pad = 4 - len(enc_key_b64) % 4
+if pad != 4:
+    enc_key_b64 += '=' * pad
+key = base64.urlsafe_b64decode(enc_key_b64)
+
+payload = f'{client_id}:{timestamp}:{nonce}'.encode()
+
+aesgcm = AESGCM(key)
+iv = os.urandom(12)
+ct = aesgcm.encrypt(iv, payload, None)
+combined = iv + ct
+print(base64.urlsafe_b64encode(combined).decode().rstrip('='))
+" "$CRED_ENC_KEY" "$CLIENT_ID" "$XAUTH_TS" "$XAUTH_NONCE")
+
+do_curl POST "$API_BASE/api/v1/chat/completions" \
+  '{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}' \
+  "X-Client-ID: $CLIENT_ID" \
+  "X-Auth: $XAUTH_REPLAY_HEADER"
+
+if [ "$HTTP_STATUS" -eq 401 ]; then
+  echo -e "  ${GREEN}✓ Nonce replay correctly rejected (401)${NC}"
+  ((PASS++))
+else
+  echo -e "  ${YELLOW}⚠ Nonce replay returned HTTP $HTTP_STATUS (expected 401)${NC}"
+  ((FAIL++))
+fi
+
+# ─── 8. Audit Logs ──────────────────────────────────────────
+section "8. Audit Logs"
 
 echo "--- List audit logs ---"
 do_curl GET "$ADMIN_BASE/api/v1/admin/audit-logs" "" \

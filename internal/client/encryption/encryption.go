@@ -80,6 +80,26 @@ func Decrypt(key []byte, encoded string) ([]byte, error) {
 	return plaintext, nil
 }
 
+// EncryptClientKey encrypts a client's encryption key or secret using the
+// master encryption key. The ciphertext is stored in the database so that
+// a DB compromise does not leak consumer-facing credentials.
+func EncryptClientKey(masterKey, plaintext string) (string, error) {
+	// Derive a deterministic key from the master key for encrypting client keys
+	key := DeriveKey(masterKey, "client-key-encryption")
+	return Encrypt(key, []byte(plaintext))
+}
+
+// DecryptClientKey decrypts a client's encryption key or secret that was
+// previously encrypted with EncryptClientKey.
+func DecryptClientKey(masterKey, ciphertext string) (string, error) {
+	key := DeriveKey(masterKey, "client-key-encryption")
+	b, err := Decrypt(key, ciphertext)
+	if err != nil {
+		return "", fmt.Errorf("decrypt client key: %w", err)
+	}
+	return string(b), nil
+}
+
 // HashClientSecret returns a SHA-256 hash of the client secret for storage.
 func HashClientSecret(secret string) string {
 	h := sha256.Sum256([]byte(secret))

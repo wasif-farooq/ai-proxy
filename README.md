@@ -312,7 +312,7 @@ POST /api/v1/chat/completions
 
 Proxies OpenAI-compatible chat completion requests to the configured upstream provider.
 
-**Headers:**
+**Headers (Bearer auth — legacy):**
 
 | Header | Required | Description |
 |--------|----------|-------------|
@@ -320,6 +320,62 @@ Proxies OpenAI-compatible chat completion requests to the configured upstream pr
 | `Authorization` | ✅ | `Bearer <client_secret>` |
 | `X-Nonce` | ✅ | Unique per-request string (replay protection) |
 | `X-Timestamp` | ✅ | Unix epoch seconds (within 5-minute window) |
+
+**Headers (Encrypted X-Auth — recommended):**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-Client-ID` | ✅ | Client identifier (from admin panel) |
+| `X-Auth` | ✅ | AES-GCM encrypted `client_id:timestamp:nonce` payload |
+
+The encrypted X-Auth method is recommended for public-facing APIs. Instead of sending a `client_secret` in plaintext (which can leak via logs or MITM), the consumer AES-GCM encrypts a payload containing their `client_id`, a Unix timestamp, and a unique nonce using their `encryption_key`. The server decrypts this payload, verifies the client ID matches, checks the timestamp is within 5 minutes, and prevents nonce reuse — all without sending a shared secret over the wire.
+
+**Getting your credentials:**
+
+1. Admin creates a client via the admin panel or API
+2. Admin gives you: `client_id` + `encryption_key` (retrievable later via `GET /clients/:id/credentials`)
+3. The `client_secret` is only shown once on creation and is used by admins for key rotation — consumers never need it
+
+**Generating the X-Auth header (concept):**
+
+```
+// Payload to encrypt:
+payload = f"{client_id}:{unix_timestamp}:{unique_nonce}"
+
+// Encrypt with AES-256-GCM:
+aes_key = base64_decode(encryption_key)  // 32 bytes
+iv = random_12_bytes()
+ciphertext = aes_256_gcm_encrypt(aes_key, iv, payload)
+
+// Prepend IV (matching Go's gcm.Seal):
+x_auth = base64_urlsafe_no_pad(iv + ciphertext)
+```
+
+**Example request:**
+
+```bash
+XAUTH=$(python3 -c "
+import base64, os, sys
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+key_b64 = sys.argv[1]
+# Add padding to make length a multiple of 4
+pad = 4 - len(key_b64) % 4
+if pad != 4:
+    key_b64 += '=' * pad
+key = base64.urlsafe_b64decode(key_b64)
+payload = f'{sys.argv[2]}:{sys.argv[3]}:{sys.argv[4]}'.encode()
+aesgcm = AESGCM(key)
+iv = os.urandom(12)
+ct = aesgcm.encrypt(iv, payload, None)
+print(base64.urlsafe_b64encode(iv + ct).decode().rstrip('='))
+" <encryption_key> <client_id> $(date +%s) $(date +%s | sha256sum | head -c 16))
+
+curl -X POST http://localhost:8080/api/v1/chat/completions \
+  -H "X-Client-ID: <client_id>" \
+  -H "X-Auth: $XAUTH" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}'
+```
 
 **Body:**
 
@@ -381,6 +437,45 @@ All admin endpoints are under `/api/v1/admin/` and require JWT authentication (e
 |--------|------|-------------|
 | `GET` | `/audit-logs` | List audit logs |
 | `GET` | `/audit-logs/:id` | Get audit log by UUID |
+
+### Consumer SDK Examples
+
+Ready-to-use SDK examples for generating the X-Auth header and making proxy requests are in the [`examples/`](examples/) directory:
+
+| Language | File | Requirements |
+|----------|------|-------------|
+| **Node.js** | [`examples/consumer-node.mjs`](examples/consumer-node.mjs) | Node.js 18+ (uses global `fetch`) |
+| **Go** | [`examples/consumer-go/main.go`](examples/consumer-go/main.go) | Go 1.25+ |
+
+**Usage (Node.js):**
+
+```bash
+export CLIENT_ID=sk-your-client-id
+export ENCRYPTION_KEY=your-base64-encoded-32-byte-key
+export PROXY_URL=http://localhost:18080
+node examples/consumer-node.mjs
+```
+
+**Usage (Go):**
+
+```bash
+export CLIENT_ID=sk-your-client-id
+export ENCRYPTION_KEY=your-base64-encoded-32-byte-key
+export PROXY_URL=http://localhost:18080
+go run examples/consumer-go/main.go
+```
+
+Both examples demonstrate:
+- AES-256-GCM encryption of the X-Auth payload with random IV
+- Non-streaming (`POST /api/v1/chat/completions`) and streaming (SSE) requests
+- Proper nonce generation via `crypto.randomUUID()` (Node.js) or `crypto/rand` (Go)
+- Error handling for auth failures, upstream errors, and network issues
+
+The encryption logic in both examples matches the server's `encryption.Encrypt` function exactly:
+
+```
+X-Auth = base64_urlsafe_no_pad( iv (12 bytes) || ciphertext || auth_tag (16 bytes) )
+```
 
 ### Supported Providers
 

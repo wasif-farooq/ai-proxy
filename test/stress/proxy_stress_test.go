@@ -5,6 +5,7 @@ package stress
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,7 +40,23 @@ const (
 	testClientSecret = "sk-stress-test-secret-1234567890"
 )
 
-var testClientHash = encryption.HashClientSecret(testClientSecret)
+var (
+	testClientHash       = encryption.HashClientSecret(testClientSecret)
+	testEncryptionKey    string
+	testEncryptionSecret string
+)
+
+func init() {
+	var err error
+	testEncryptionKey, err = encryption.GenerateSecret()
+	if err != nil {
+		panic("failed to generate test encryption key: " + err.Error())
+	}
+	testEncryptionSecret, err = encryption.GenerateSecret()
+	if err != nil {
+		panic("failed to generate test encryption secret: " + err.Error())
+	}
+}
 
 type mockClientRepo struct{}
 
@@ -68,16 +85,25 @@ func (m *mockClientRepo) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+const testMasterKey = "stress-test-master-key"
+
 func testClient() *client.Client {
 	now := time.Now()
+
+	// Encrypt keys at rest so the Service layer's decryptClientKeys can
+	// properly decrypt them (mirrors the real repo which stores encrypted keys).
+	// The cached client will have the raw keys for middleware access.
+	encKeyEnc, _ := encryption.EncryptClientKey(testMasterKey, testEncryptionKey)
+	encSecretEnc, _ := encryption.EncryptClientKey(testMasterKey, testEncryptionSecret)
+
 	return &client.Client{
 		ID:               "mock-client-uuid",
 		ClientID:         testClientID,
 		ClientSecretHash: testClientHash,
 		Name:             "Stress Test Client",
 		Status:           client.ClientStatusActive,
-		EncryptionKey:    "fake-encryption-key-for-stress-testing",
-		EncryptionSecret: "fake-encryption-secret-for-stress-testing",
+		EncryptionKey:    encKeyEnc,
+		EncryptionSecret: encSecretEnc,
 		PreferredProviders: []client.ClientPreferredRoute{
 			{Provider: "openai", Model: "gpt-4o"},
 		},
@@ -660,6 +686,171 @@ func runStreamingStressTest(serverURL string, concurrency, requestsPerWorker int
 }
 
 // ═══════════════════════════════════════════════════════════════
+// X-Auth header builder for encrypted auth path
+// ═══════════════════════════════════════════════════════════════
+
+// buildXAuthHeader encrypts "client_id:timestamp:nonce" with AES-GCM using
+// the client's encryption_key (base64-encoded 32-byte key).
+func buildXAuthHeader(clientID, encryptionKey, nonce string, timestamp int64) string {
+	key, err := base64.RawURLEncoding.DecodeString(encryptionKey)
+	if err != nil {
+		return ""
+	}
+	payload := fmt.Sprintf("%s:%d:%s", clientID, timestamp, nonce)
+	encrypted, err := encryption.Encrypt(key, []byte(payload))
+	if err != nil {
+		return ""
+	}
+	return encrypted
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Encrypted auth: non-streaming stress test runner
+// ═══════════════════════════════════════════════════════════════
+
+func runStressTestEncrypted(serverURL string, concurrency, requestsPerWorker int) *stressMetrics {
+	metrics := newStressMetrics()
+	metrics.startTime = time.Now()
+
+	var nonceCounter uint64
+	var wg sync.WaitGroup
+
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			client := &http.Client{
+				Timeout: 30 * time.Second,
+				Transport: &http.Transport{
+					MaxIdleConnsPerHost: 100,
+					MaxIdleConns:        200,
+				},
+			}
+
+			for i := 0; i < requestsPerWorker; i++ {
+				nonce := fmt.Sprintf("xauth-stress-%d-%d-%d", workerID, i, atomic.AddUint64(&nonceCounter, 1))
+				now := time.Now().Unix()
+				xAuth := buildXAuthHeader(testClientID, testEncryptionKey, nonce, now)
+				body := `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"stream":false}`
+
+				req, err := http.NewRequest("POST", serverURL+"/api/v1/chat/completions",
+					bytes.NewReader([]byte(body)))
+				if err != nil {
+					metrics.record(0, 500)
+					continue
+				}
+
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-Client-ID", testClientID)
+				req.Header.Set("X-Auth", xAuth)
+
+				start := time.Now()
+				resp, err := client.Do(req)
+				latency := time.Since(start)
+
+				if err != nil {
+					metrics.record(latency, 500)
+					continue
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				metrics.record(latency, resp.StatusCode)
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	metrics.endTime = time.Now()
+
+	return metrics
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Encrypted auth: streaming stress test runner
+// ═══════════════════════════════════════════════════════════════
+
+func runStreamingStressTestEncrypted(serverURL string, concurrency, requestsPerWorker int) *streamingMetrics {
+	metrics := newStreamingMetrics()
+	metrics.stressMetrics.startTime = time.Now()
+
+	var nonceCounter uint64
+	var wg sync.WaitGroup
+
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			client := &http.Client{
+				Timeout: 60 * time.Second,
+				Transport: &http.Transport{
+					MaxIdleConnsPerHost: 100,
+					MaxIdleConns:        200,
+				},
+			}
+
+			for i := 0; i < requestsPerWorker; i++ {
+				nonce := fmt.Sprintf("xauth-sse-stress-%d-%d-%d", workerID, i, atomic.AddUint64(&nonceCounter, 1))
+				now := time.Now().Unix()
+				xAuth := buildXAuthHeader(testClientID, testEncryptionKey, nonce, now)
+				body := `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"stream":true}`
+
+				req, err := http.NewRequest("POST", serverURL+"/api/v1/chat/completions",
+					bytes.NewReader([]byte(body)))
+				if err != nil {
+					metrics.stressMetrics.record(0, 500)
+					continue
+				}
+
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-Client-ID", testClientID)
+				req.Header.Set("X-Auth", xAuth)
+
+				start := time.Now()
+				resp, err := client.Do(req)
+				if err != nil {
+					totalLatency := time.Since(start)
+					metrics.recordStream(totalLatency, totalLatency, 500, 0, false)
+					continue
+				}
+
+				// Read response body as SSE
+				var firstChunkLatency time.Duration
+				var totalBytes int64
+				firstChunk := true
+				verified := false
+				buf := make([]byte, 4096)
+
+				for {
+					n, readErr := resp.Body.Read(buf)
+					if n > 0 {
+						totalBytes += int64(n)
+						if firstChunk {
+							firstChunkLatency = time.Since(start)
+							firstChunk = false
+						}
+						if strings.Contains(string(buf[:n]), "[DONE]") {
+							verified = true
+						}
+					}
+					if readErr != nil {
+						break
+					}
+				}
+				resp.Body.Close()
+
+				totalLatency := time.Since(start)
+				metrics.recordStream(firstChunkLatency, totalLatency, resp.StatusCode, totalBytes, verified)
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	metrics.stressMetrics.endTime = time.Now()
+
+	return metrics
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Load-test levels
 // ═══════════════════════════════════════════════════════════════
 
@@ -922,5 +1113,237 @@ func TestProxyStreamingStress(t *testing.T) {
 	t.Log()
 	t.Log("══════════════════════════════════════════════════════════════════")
 	t.Log("  STREAMING STRESS TEST COMPLETE")
+	t.Log("══════════════════════════════════════════════════════════════════")
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test 3: Non-streaming stress test — Encrypted X-Auth path
+//   go test -tags=stress -v ./test/stress -run TestProxyStressEncryptedAuth -timeout 5m
+// ══════════════════════════════════════════════════════════════════════════
+
+func TestProxyStressEncryptedAuth(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	gin.SetMode(gin.ReleaseMode)
+	logger.Init(logger.Config{Level: "error", Format: "text", AddSource: false})
+
+	// ── 1. Start mock upstream ────────────────────────────────
+	upstreamHandler := &mockUpstreamHandler{
+		minLatency: 20 * time.Millisecond,
+		maxLatency: 80 * time.Millisecond,
+		failRate:   0.02,
+	}
+	mockUpstream := httptest.NewServer(upstreamHandler)
+	defer mockUpstream.Close()
+	t.Logf("Mock upstream provider running at: %s", mockUpstream.URL)
+
+	// ── 2. Set up dependencies ────────────────────────────────
+	clientRepo := &mockClientRepo{}
+	clientSvc := client.NewService(clientRepo, "stress-test-master-key")
+
+	providerRepo := &mockProviderRepo{upstreamURL: mockUpstream.URL}
+	providerReg := provider.NewRegistry(providerRepo)
+	if err := providerReg.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh registry: %v", err)
+	}
+
+	providerKeySvc := client.NewProviderKeyService(&mockKeyRepo{}, clientSvc, "stress-test-master-key")
+	proxy := provider.NewProxy(providerReg, providerKeySvc, 30*time.Second)
+
+	nonceStore := security.NewInMemoryNonceStore(5 * time.Minute)
+	rateLimiter := security.NewRateLimiter(100000, 10000)
+	defer rateLimiter.Stop()
+
+	// ── 3. Create Gin router with DualAuthMiddleware ──────────
+	cfg := config.Load()
+	cfg.RateLimitRequestsPerMin = 100000
+	cfg.RateLimitBurst = 10000
+
+	router := shared.NewRouter(cfg)
+	api := router.Group("/api/v1")
+	api.POST("/chat/completions",
+		provider.DualAuthMiddleware(clientSvc, nonceStore, 5*time.Minute),
+		security.RateLimitMiddleware(rateLimiter),
+		provider.RouteMiddleware(proxy),
+	)
+
+	proxyServer := httptest.NewServer(router)
+	defer proxyServer.Close()
+	t.Logf("Proxy server running at: %s", proxyServer.URL)
+
+	// ── 4. Warm-up ───────────────────────────────────────────
+	t.Log("\n━━━ Warm-up (10 requests, encrypted X-Auth) ━━━")
+	warmupMetrics := runStressTestEncrypted(proxyServer.URL, 2, 5)
+	t.Log(warmupMetrics.report(2))
+	t.Log("Warm-up complete.\n")
+
+	// ── 5. Run all stress levels ─────────────────────────────
+	var allMetrics []*stressMetrics
+
+	for _, l := range stressLevels {
+		t.Logf("\n━━━ Running: %s (%d concurrent, %d req each, X-Auth auth) ━━━",
+			l.label, l.concurrency, l.perWorker)
+
+		metrics := runStressTestEncrypted(proxyServer.URL, l.concurrency, l.perWorker)
+		t.Log(metrics.report(l.concurrency))
+		allMetrics = append(allMetrics, metrics)
+	}
+
+	// ── 6. Summary dashboard ─────────────────────────────────
+	t.Log("\n\n╔══════════════════════════════════════════════════════════════════╗")
+	t.Log("║   NON-STREAMING STRESS TEST — ENCRYPTED X-AUTH AUTH             ║")
+	t.Log("╚══════════════════════════════════════════════════════════════════╝")
+	t.Log()
+	t.Logf("Mock upstream latency:  %s – %s (uniform random)", formatDur(20*time.Millisecond), formatDur(80*time.Millisecond))
+	t.Logf("Mock upstream failure:  2%%")
+	t.Logf("Auth method:            X-Auth (AES-GCM encrypted payload)")
+	t.Logf("Middleware chain:       DualAuth (encrypted) → RateLimit → Route → Proxy → Forward")
+	t.Log()
+	for i, l := range stressLevels {
+		t.Logf("── Level %d: %s (%d concurrent) ──", i+1, l.label, l.concurrency)
+		t.Log(allMetrics[i].report(l.concurrency))
+	}
+	t.Log()
+	t.Log("Dashboard summary:")
+	t.Log("────────────────────────────────────────────────────────────────")
+	t.Log("Level    Concurrency    Throughput     p50        p99        Errors")
+	t.Log("────────────────────────────────────────────────────────────────")
+	for i, l := range stressLevels {
+		m := allMetrics[i]
+		bar := ""
+		rps := m.rps()
+		maxRps := 1000.0
+		barLen := int(rps / maxRps * 20)
+		if barLen > 20 {
+			barLen = 20
+		} else if barLen < 1 {
+			barLen = 1
+		}
+		for j := 0; j < barLen; j++ {
+			bar += "█"
+		}
+		t.Logf("  %d  │  %3d concurrent  │  %8.1f/s   │ %7s  │ %7s  │ %3d (%4.1f%%)   %s",
+			i+1, l.concurrency, rps,
+			formatDur(m.p50()), formatDur(m.p99()),
+			m.failures, pct(m.failures, m.total()),
+			bar)
+	}
+	t.Log("────────────────────────────────────────────────────────────────")
+	t.Log()
+	t.Log("══════════════════════════════════════════════════════════════════")
+	t.Log("  X-AUTH STRESS TEST COMPLETE")
+	t.Log("══════════════════════════════════════════════════════════════════")
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Test 4: Streaming stress test — Encrypted X-Auth path
+//   go test -tags=stress -v ./test/stress -run TestProxyStreamingStressEncryptedAuth -timeout 5m
+// ══════════════════════════════════════════════════════════════════════════
+
+func TestProxyStreamingStressEncryptedAuth(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	gin.SetMode(gin.ReleaseMode)
+	logger.Init(logger.Config{Level: "error", Format: "text", AddSource: false})
+
+	// ── 1. Start mock SSE upstream ───────────────────────────
+	sseHandler := &mockSSEUpstreamHandler{
+		initialLatency: 20 * time.Millisecond,
+		chunkCount:     11,
+		chunkInterval:  5 * time.Millisecond,
+		failRate:       0.02,
+	}
+	mockUpstream := httptest.NewServer(sseHandler)
+	defer mockUpstream.Close()
+	t.Logf("Mock SSE upstream running at: %s", mockUpstream.URL)
+
+	// ── 2. Set up deps ───────────────────────────────────────
+	clientRepo := &mockClientRepo{}
+	clientSvc := client.NewService(clientRepo, "stress-test-master-key")
+
+	providerRepo := &mockProviderRepo{upstreamURL: mockUpstream.URL}
+	providerReg := provider.NewRegistry(providerRepo)
+	if err := providerReg.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh registry: %v", err)
+	}
+
+	providerKeySvc := client.NewProviderKeyService(&mockKeyRepo{}, clientSvc, "stress-test-master-key")
+	proxy := provider.NewProxy(providerReg, providerKeySvc, 60*time.Second)
+
+	nonceStore := security.NewInMemoryNonceStore(5 * time.Minute)
+	rateLimiter := security.NewRateLimiter(100000, 10000)
+	defer rateLimiter.Stop()
+
+	// ── 3. Gin router with DualAuthMiddleware ────────────────
+	cfg := config.Load()
+	cfg.RateLimitRequestsPerMin = 100000
+	cfg.RateLimitBurst = 10000
+
+	router := shared.NewRouter(cfg)
+	api := router.Group("/api/v1")
+	api.POST("/chat/completions",
+		provider.DualAuthMiddleware(clientSvc, nonceStore, 5*time.Minute),
+		security.RateLimitMiddleware(rateLimiter),
+		provider.RouteMiddleware(proxy),
+	)
+
+	proxyServer := httptest.NewServer(router)
+	defer proxyServer.Close()
+	t.Logf("Proxy server running at: %s", proxyServer.URL)
+
+	// ── 4. Warm-up ───────────────────────────────────────────
+	t.Log("\n━━━ SSE Warm-up (6 requests, encrypted X-Auth) ━━━")
+	warmupMetrics := runStreamingStressTestEncrypted(proxyServer.URL, 2, 3)
+	t.Log(warmupMetrics.reportStream(2))
+	t.Log("Warm-up complete.\n")
+
+	// ── 5. Run all streaming stress levels ──────────────────
+	var allMetrics []*streamingMetrics
+
+	for _, l := range streamingLevels {
+		t.Logf("\n━━━ SSE: %s (%d concurrent, %d req each, X-Auth auth) ━━━",
+			l.label, l.concurrency, l.perWorker)
+
+		metrics := runStreamingStressTestEncrypted(proxyServer.URL, l.concurrency, l.perWorker)
+		t.Log(metrics.reportStream(l.concurrency))
+		allMetrics = append(allMetrics, metrics)
+	}
+
+	// ── 6. Summary dashboard ─────────────────────────────────
+	t.Log("\n\n╔══════════════════════════════════════════════════════════════════╗")
+	t.Log("║     STREAMING STRESS TEST — ENCRYPTED X-AUTH AUTH               ║")
+	t.Log("╚══════════════════════════════════════════════════════════════════╝")
+	t.Log()
+	t.Log("Mock SSE upstream:")
+	t.Logf("  Initial latency:  %s", formatDur(sseHandler.initialLatency))
+	t.Logf("  Chunks:           %d × %s interval", sseHandler.chunkCount, formatDur(sseHandler.chunkInterval))
+	t.Logf("  Total stream:     ~%s", formatDur(sseHandler.initialLatency+time.Duration(sseHandler.chunkCount)*sseHandler.chunkInterval))
+	t.Log("Auth method:        X-Auth (AES-GCM encrypted payload)")
+	t.Log("Middleware chain:   DualAuth (encrypted) → RateLimit → Route → Proxy → ForwardStreaming")
+	t.Log()
+
+	t.Log("Per-level reports:")
+	for i, l := range streamingLevels {
+		t.Logf("── Level %d: %s (%d concurrent) ──", i+1, l.label, l.concurrency)
+		t.Log(allMetrics[i].reportStream(l.concurrency))
+	}
+
+	t.Log()
+	t.Log("Streaming dashboard:")
+	t.Log("─────────────────────────────────────────────────────────────────────────────")
+	t.Log("Lvl  Concurrency   Throughput    TTFC p50   TTFC p99   Total p99   Errors")
+	t.Log("─────────────────────────────────────────────────────────────────────────────")
+	for i, l := range streamingLevels {
+		m := allMetrics[i]
+		t.Logf(" %2d     %3d          %7.1f/s     %8s    %8s    %8s    %3d (%4.1f%%)",
+			i+1, l.concurrency, m.rps(),
+			formatDur(m.ttfcPercentile(50)), formatDur(m.ttfcPercentile(99)),
+			formatDur(m.p99()),
+			m.failures, pct(m.failures, m.total()))
+	}
+	t.Log("─────────────────────────────────────────────────────────────────────────────")
+	t.Log()
+	t.Log("══════════════════════════════════════════════════════════════════")
+	t.Log("  X-AUTH STREAMING STRESS TEST COMPLETE")
 	t.Log("══════════════════════════════════════════════════════════════════")
 }

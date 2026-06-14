@@ -46,7 +46,8 @@ func generateClientSecret() (string, error) {
 
 // Create registers a new client and returns the full entity with its
 // plain-text secret, encryption key, and encryption secret (all shown once).
-// The secret is hashed before storage.
+// The secret is hashed before storage; the encryption key and secret are
+// encrypted at rest using the master encryption key.
 func (s *Service) Create(ctx context.Context, name string, providers []ClientPreferredRoute) (*Client, string, string, string, error) {
 	if name == "" {
 		return nil, "", "", "", shared.ErrValidation.WithDetail("client name is required")
@@ -69,18 +70,32 @@ func (s *Service) Create(ctx context.Context, name string, providers []ClientPre
 		return nil, "", "", "", shared.ErrInternal.WithDetail(err.Error())
 	}
 
+	// Encrypt keys at rest before storing
+	encKeyEncrypted, err := encryption.EncryptClientKey(s.masterKey, encKey)
+	if err != nil {
+		return nil, "", "", "", shared.ErrInternal.WithDetail("failed to encrypt client key")
+	}
+	encSecretEncrypted, err := encryption.EncryptClientKey(s.masterKey, encSecret)
+	if err != nil {
+		return nil, "", "", "", shared.ErrInternal.WithDetail("failed to encrypt client secret")
+	}
+
 	input := CreateClientInput{
 		Name:               name,
 		PreferredProviders: providers,
 		ClientSecret:       secretHash,
-		EncryptionKey:      encKey,
-		EncryptionSecret:   encSecret,
+		EncryptionKey:      encKeyEncrypted,
+		EncryptionSecret:   encSecretEncrypted,
 	}
 
 	client, err := s.repo.Create(ctx, input)
 	if err != nil {
 		return nil, "", "", "", fmt.Errorf("create client: %w", err)
 	}
+
+	// Set raw keys on the in-memory client (for cache, middleware, etc.)
+	client.EncryptionKey = encKey
+	client.EncryptionSecret = encSecret
 
 	// Cache the new client
 	s.cache.Set(client)
@@ -93,6 +108,7 @@ func (s *Service) Create(ctx context.Context, name string, providers []ClientPre
 }
 
 // GetByClientID retrieves a client by its client_id, checking cache first.
+// Decrypts the encryption key and secret after loading from the database.
 func (s *Service) GetByClientID(ctx context.Context, clientID string) (*Client, error) {
 	// Fast path: check cache
 	if cached := s.cache.Get(clientID); cached != nil {
@@ -108,12 +124,18 @@ func (s *Service) GetByClientID(ctx context.Context, clientID string) (*Client, 
 		return nil, shared.ErrNotFound.WithDetail("client not found")
 	}
 
-	// Populate cache
+	// Decrypt keys for in-memory use
+	if err := s.decryptClientKeys(client); err != nil {
+		return nil, fmt.Errorf("decrypt client keys: %w", err)
+	}
+
+	// Populate cache (with raw keys for fast middleware access)
 	s.cache.Set(client)
 	return client, nil
 }
 
 // GetByID retrieves a client by its internal UUID.
+// Decrypts the encryption key and secret after loading from the database.
 func (s *Service) GetByID(ctx context.Context, id string) (*Client, error) {
 	client, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -122,6 +144,12 @@ func (s *Service) GetByID(ctx context.Context, id string) (*Client, error) {
 	if client == nil {
 		return nil, shared.ErrNotFound.WithDetail("client not found")
 	}
+
+	// Decrypt keys for in-memory use
+	if err := s.decryptClientKeys(client); err != nil {
+		return nil, fmt.Errorf("decrypt client keys: %w", err)
+	}
+
 	return client, nil
 }
 
@@ -144,6 +172,11 @@ func (s *Service) Update(ctx context.Context, id string, input UpdateClientInput
 	client, err := s.repo.Update(ctx, id, input)
 	if err != nil {
 		return nil, fmt.Errorf("update client: %w", err)
+	}
+
+	// Decrypt keys for in-memory use (update doesn't change keys, but they come back encrypted)
+	if err := s.decryptClientKeys(client); err != nil {
+		return nil, fmt.Errorf("decrypt client keys: %w", err)
 	}
 
 	// Refresh cache
@@ -170,6 +203,11 @@ func (s *Service) UpdateStatus(ctx context.Context, id string, status ClientStat
 	client, err := s.repo.UpdateStatus(ctx, id, status)
 	if err != nil {
 		return nil, fmt.Errorf("update status: %w", err)
+	}
+
+	// Decrypt keys for in-memory use
+	if err := s.decryptClientKeys(client); err != nil {
+		return nil, fmt.Errorf("decrypt client keys: %w", err)
 	}
 
 	// If revoked, remove from cache; otherwise refresh
@@ -212,10 +250,24 @@ func (s *Service) RotateKeys(ctx context.Context, id string) (*Client, string, s
 		return nil, "", "", "", shared.ErrInternal.WithDetail(err.Error())
 	}
 
-	client, err := s.repo.RotateKeys(ctx, id, secretHash, encKey, encSecret)
+	// Encrypt new keys before storing
+	encKeyEncrypted, err := encryption.EncryptClientKey(s.masterKey, encKey)
+	if err != nil {
+		return nil, "", "", "", shared.ErrInternal.WithDetail("failed to encrypt client key")
+	}
+	encSecretEncrypted, err := encryption.EncryptClientKey(s.masterKey, encSecret)
+	if err != nil {
+		return nil, "", "", "", shared.ErrInternal.WithDetail("failed to encrypt client secret")
+	}
+
+	client, err := s.repo.RotateKeys(ctx, id, secretHash, encKeyEncrypted, encSecretEncrypted)
 	if err != nil {
 		return nil, "", "", "", fmt.Errorf("rotate keys: %w", err)
 	}
+
+	// Set raw keys on the in-memory client
+	client.EncryptionKey = encKey
+	client.EncryptionSecret = encSecret
 
 	s.cache.Set(client)
 
@@ -228,6 +280,25 @@ func (s *Service) RotateKeys(ctx context.Context, id string) (*Client, string, s
 // ValidateClientSecret compares a plain-text secret against the stored hash.
 func (s *Service) ValidateClientSecret(client *Client, plainSecret string) bool {
 	return encryption.HashClientSecret(plainSecret) == client.ClientSecretHash
+}
+
+// decryptClientKeys decrypts the encryption key and secret on a *Client that
+// was just loaded from the database (where they are stored encrypted at rest).
+func (s *Service) decryptClientKeys(client *Client) error {
+	if client.EncryptionKey == "" {
+		return nil // no keys to decrypt (shouldn't happen for real clients)
+	}
+	rawKey, err := encryption.DecryptClientKey(s.masterKey, client.EncryptionKey)
+	if err != nil {
+		return fmt.Errorf("decrypt encryption key: %w", err)
+	}
+	rawSecret, err := encryption.DecryptClientKey(s.masterKey, client.EncryptionSecret)
+	if err != nil {
+		return fmt.Errorf("decrypt encryption secret: %w", err)
+	}
+	client.EncryptionKey = rawKey
+	client.EncryptionSecret = rawSecret
+	return nil
 }
 
 // Delete permanently removes a client.

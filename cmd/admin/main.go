@@ -84,6 +84,7 @@ func main() {
 
 		deps.AuditSvc.Stop()
 		deps.ClientSvc.Stop()
+		deps.ProviderKeySvc.Stop()
 
 		shutdownCtx, shutdownCancel := bootstrap.ShutdownCtx()
 		defer shutdownCancel()

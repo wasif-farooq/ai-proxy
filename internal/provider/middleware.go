@@ -94,8 +94,9 @@ func AuthMiddleware(clientService *client.Service) gin.HandlerFunc {
 		c.Set("client_id", cl.ClientID)
 		c.Set("preferred_providers", cl.PreferredProviders)
 
-		// Also store client_id in request context so the proxy can access it
+		// Store client and client_id in request context so the proxy can access them
 		ctx := context.WithValue(c.Request.Context(), clientIDKey{}, cl.ClientID)
+		ctx = context.WithValue(ctx, clientKey{}, cl)
 		c.Request = c.Request.WithContext(ctx)
 
 		c.Next()
@@ -109,7 +110,7 @@ func AuthMiddleware(clientService *client.Service) gin.HandlerFunc {
 // responses based on the request body's `stream` field.
 func RouteMiddleware(proxy *Proxy) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Read request body
+		// Read request body (Gin caches it internally)
 		body, err := c.GetRawData()
 		if err != nil {
 			abortWithProxyError(c, http.StatusBadRequest, "Bad request", "Failed to read request body")
@@ -120,7 +121,7 @@ func RouteMiddleware(proxy *Proxy) gin.HandlerFunc {
 	preferredProviders, _ := c.Get("preferred_providers")
 	prefs, _ := preferredProviders.([]client.ClientPreferredRoute)
 
-	// Determine target model, provider, and stream mode in a single parse
+	// Determine target model, provider, and stream mode
 	model, providerID, isStream, err := resolveModelAndProvider(body, prefs)
 		if err != nil {
 			abortWithProxyError(c, http.StatusBadRequest, "Bad request", err.Error())
@@ -162,16 +163,16 @@ func RouteMiddleware(proxy *Proxy) gin.HandlerFunc {
 		}
 
 		latencyMs := time.Since(start).Milliseconds()
-		logger.FromContext(c.Request.Context()).Info("proxy request completed",
+		logger.FromContext(c.Request.Context()).Debug("proxy request completed",
 			slog.String("model", model),
-			slog.String(logger.KeyLatencyMs, fmt.Sprintf("%dms", latencyMs)),
+			slog.Int64("latency_ms", latencyMs),
 		)
 	}
 }
 
 /* ─── Helpers ────────────────────────────────────────────── */
 
-// resolveModelAndProvider extracts the model name from the request body
+// resolveModelAndProvider extracts model and stream flags from the request body
 // and determines which provider should handle it.
 func resolveModelAndProvider(body []byte, preferredProviders []client.ClientPreferredRoute) (string, ProviderID, bool, error) {
 	var req struct {

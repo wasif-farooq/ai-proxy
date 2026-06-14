@@ -104,13 +104,13 @@ func RateLimitMiddleware(rl *RateLimiter) gin.HandlerFunc {
 
 		if !rl.Allow(clientID) {
 			c.Header("X-RateLimit-Remaining", "0")
-			c.Header("Retry-After", strconv.Itoa(int(rl.interval.Seconds())))
+			c.Header("Retry-After", strconv.Itoa(int(rl.refillInterval.Seconds())))
 
 			logger.FromContext(c.Request.Context()).Warn("rate limit exceeded",
 				slog.String("client_id", clientID),
 			)
 			abortWithError(c, http.StatusTooManyRequests, "Rate limit exceeded",
-				fmt.Sprintf("retry after %d seconds", int(rl.interval.Seconds())))
+				fmt.Sprintf("retry after %d seconds", int(rl.refillInterval.Seconds())))
 			return
 		}
 

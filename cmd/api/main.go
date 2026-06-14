@@ -61,6 +61,7 @@ func main() {
 
 		deps.AuditSvc.Stop()
 		deps.ClientSvc.Stop()
+		deps.ProviderKeySvc.Stop()
 		rateLimiter.Stop()
 		nonceStore.Stop()
 

@@ -299,8 +299,10 @@ func testClientsCreate(t *testing.T) {
 	loginAsAdmin(t)
 
 	body := map[string]interface{}{
-		"name":                "E2E Test Client",
-		"preferred_providers": []string{"openai"},
+		"name": "E2E Test Client",
+		"preferred_providers": []map[string]interface{}{
+			{"provider": "openai", "model": "gpt-4"},
+		},
 	}
 	resp, ar, err := doRequest("POST", adminBase+"/api/v1/admin/clients", body, adminHeaders())
 	if err != nil {
@@ -533,10 +535,10 @@ func testProvidersCreate(t *testing.T) {
 	loginAsAdmin(t)
 
 	body := map[string]interface{}{
-		"provider_id": "openai",
-		"name":        "OpenAI E2E",
+		"provider_id": "custom",
+		"name":        "Custom E2E",
 		"api_key":     "sk-test-key-12345",
-		"base_url":    "https://api.openai.com/v1",
+		"base_url":    "https://api.custom.com/v1",
 		"models":      []string{"gpt-4", "gpt-4-turbo", "gpt-3.5-turbo"},
 	}
 	resp, ar, err := doRequest("POST", adminBase+"/api/v1/admin/providers", body, adminHeaders())
@@ -555,8 +557,8 @@ func testProvidersCreate(t *testing.T) {
 	if err := json.Unmarshal(ar.Data, &provider); err != nil {
 		t.Fatalf("unmarshal provider: %v", err)
 	}
-	if provider.ProviderID != "openai" {
-		t.Errorf("expected provider_id 'openai', got %q", provider.ProviderID)
+	if provider.ProviderID != "custom" {
+		t.Errorf("expected provider_id 'custom', got %q", provider.ProviderID)
 	}
 	if len(provider.Models) != 3 {
 		t.Errorf("expected 3 models, got %d", len(provider.Models))
@@ -644,7 +646,7 @@ func testProvidersDelete(t *testing.T) {
 
 	// Create a provider to delete
 	body := map[string]interface{}{
-		"provider_id": "custom",
+		"provider_id": "azure",
 		"name":        "Provider To Delete",
 		"api_key":     "sk-test-key",
 	}

@@ -21,12 +21,12 @@ import (
 /* ─── Constants ─────────────────────────────────────────── */
 
 const (
-	apiBase   = "http://localhost:8080"
-	adminBase = "http://localhost:8081"
+	apiBase   = "http://localhost:18080"
+	adminBase = "http://localhost:18081"
 
-	adminEmail    = "admin@test.local"
-	adminPassword = "test-password-1234!"
-	adminName     = "Test Admin"
+	adminEmail    = "admin@example.com"
+	adminPassword = "admin"
+	adminName     = "Super Admin"
 	adminRole     = "super_admin"
 
 	jwtSecret = "test-jwt-secret-for-e2e"
@@ -50,26 +50,16 @@ var suite Suite
 func TestMain(m *testing.M) {
 	log.Println("=== E2E Test Suite Setup ===")
 
-	if err := dockerComposeUp(); err != nil {
-		log.Fatalf("Failed to start docker compose: %v", err)
-	}
-
-	if err := waitForHealth(5 * time.Minute); err != nil {
-		dockerComposeDown()
-		log.Fatalf("Services not ready: %v", err)
-	}
-
-	if err := seedAdminUser(); err != nil {
-		dockerComposeDown()
-		log.Fatalf("Failed to seed admin user: %v", err)
+	log.Println("Verifying running stack...")
+	if err := waitForHealth(30 * time.Second); err != nil {
+		log.Fatalf("Docker stack not ready (expected at %s and %s): %v", apiBase, adminBase, err)
 	}
 
 	log.Println("Setup complete. Running tests...")
 
 	exitCode := m.Run()
 
-	log.Println("=== E2E Test Suite Teardown ===")
-	dockerComposeDown()
+	log.Println("=== E2E Test Suite Complete ===")
 
 	os.Exit(exitCode)
 }

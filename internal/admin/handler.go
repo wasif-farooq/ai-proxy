@@ -341,7 +341,7 @@ func (h *Handler) ListClientProviderKeys(c *gin.Context) {
 		return
 	}
 
-	keys, err := h.providerKeySvc.List(c.Request.Context(), cl.ClientID)
+	keys, err := h.providerKeySvc.List(c.Request.Context(), cl.ID)
 	if err != nil {
 		logger.FromContext(c.Request.Context()).Error("list provider keys failed", slog.String("error", err.Error()))
 		shared.SendError(c, shared.ErrInternal)
@@ -374,7 +374,7 @@ func (h *Handler) SetClientProviderKey(c *gin.Context) {
 	}
 
 	input := client.SetClientProviderKeyInput{
-		ClientID: cl.ClientID,
+		ClientID: cl.ID,
 		Provider: providerID,
 		APIKey:   req.APIKey,
 		BaseURL:  req.BaseURL,
@@ -422,7 +422,7 @@ func (h *Handler) DeleteClientProviderKey(c *gin.Context) {
 		return
 	}
 
-	if err := h.providerKeySvc.Delete(c.Request.Context(), cl.ClientID, providerID); err != nil {
+	if err := h.providerKeySvc.Delete(c.Request.Context(), cl.ID, providerID); err != nil {
 		shared.SendError(c, shared.ErrNotFound)
 		return
 	}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -177,13 +179,116 @@ func (r *PostgresClientProviderKeyRepository) DeleteAllForClient(ctx context.Con
 	return nil
 }
 
+/* ─── Provider Key Cache ─────────────────────────────────── */
+
+// providerKeyCacheEntry holds a decrypted provider key with its model restrictions.
+type providerKeyCacheEntry struct {
+	apiKey    string
+	models    []string
+	expiresAt time.Time
+}
+
+// providerKeyCache provides a thread-safe in-memory store for decrypted
+// provider keys, keyed by "clientID:provider". TTL is 5 minutes.
+type providerKeyCache struct {
+	mu      sync.RWMutex
+	entries map[string]*providerKeyCacheEntry
+	ttl     time.Duration
+	stopCh  chan struct{}
+}
+
+func newProviderKeyCache(ttl time.Duration) *providerKeyCache {
+	c := &providerKeyCache{
+		entries: make(map[string]*providerKeyCacheEntry),
+		ttl:     ttl,
+		stopCh:  make(chan struct{}),
+	}
+	go c.evictLoop()
+	return c
+}
+
+func (c *providerKeyCache) cacheKey(clientID, provider string) string {
+	return clientID + ":" + provider
+}
+
+func (c *providerKeyCache) get(clientID, provider string) (string, []string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, ok := c.entries[c.cacheKey(clientID, provider)]
+	if !ok {
+		return "", nil, false
+	}
+	if time.Now().After(entry.expiresAt) {
+		return "", nil, false
+	}
+	return entry.apiKey, entry.models, true
+}
+
+func (c *providerKeyCache) set(clientID, provider, apiKey string, models []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.entries[c.cacheKey(clientID, provider)] = &providerKeyCacheEntry{
+		apiKey:    apiKey,
+		models:    models,
+		expiresAt: time.Now().Add(c.ttl),
+	}
+}
+
+func (c *providerKeyCache) del(clientID, provider string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, c.cacheKey(clientID, provider))
+}
+
+func (c *providerKeyCache) delAllForClient(clientID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prefix := clientID + ":"
+	for k := range c.entries {
+		if strings.HasPrefix(k, prefix) {
+			delete(c.entries, k)
+		}
+	}
+}
+
+func (c *providerKeyCache) stop() {
+	close(c.stopCh)
+}
+
+func (c *providerKeyCache) evictLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.evictExpired()
+		case <-c.stopCh:
+			return
+		}
+	}
+}
+
+func (c *providerKeyCache) evictExpired() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	for k, entry := range c.entries {
+		if now.After(entry.expiresAt) {
+			delete(c.entries, k)
+		}
+	}
+}
+
 /* ─── Service ────────────────────────────────────────────── */
 
 // ProviderKeyService handles business logic for per-client provider API keys.
 type ProviderKeyService struct {
-	keyRepo   ClientProviderKeyRepository
+	keyRepo  ClientProviderKeyRepository
 	clientSvc *Service // for looking up client encryption material
 	masterKey string
+	cache    *providerKeyCache
 }
 
 // NewProviderKeyService creates a new provider key service.
@@ -192,7 +297,13 @@ func NewProviderKeyService(keyRepo ClientProviderKeyRepository, clientSvc *Servi
 		keyRepo:   keyRepo,
 		clientSvc: clientSvc,
 		masterKey: masterKey,
+		cache:     newProviderKeyCache(5 * time.Minute),
 	}
+}
+
+// Stop shuts down the background cache eviction goroutine.
+func (s *ProviderKeyService) Stop() {
+	s.cache.stop()
 }
 
 // deriveKey derives an AES key from the master key and client-specific encryption key.
@@ -201,8 +312,11 @@ func (s *ProviderKeyService) deriveKey(client *Client) []byte {
 }
 
 // Set sets a provider API key for a client. Returns the raw key in the response (shown once).
+// Invalidates the cache for this client+provider pair.
+// input.ClientID must be the client's internal UUID (clients.id), not the public client_id.
 func (s *ProviderKeyService) Set(ctx context.Context, input SetClientProviderKeyInput) (*ClientProviderKey, string, error) {
-	client, err := s.clientSvc.GetByClientID(ctx, input.ClientID)
+	// input.ClientID is the internal UUID (set by the admin handler)
+	client, err := s.clientSvc.GetByID(ctx, input.ClientID)
 	if err != nil {
 		return nil, "", fmt.Errorf("lookup client: %w", err)
 	}
@@ -220,6 +334,9 @@ func (s *ProviderKeyService) Set(ctx context.Context, input SetClientProviderKey
 	if err != nil {
 		return nil, "", fmt.Errorf("set provider key: %w", err)
 	}
+
+	// Invalidate cache so subsequent requests pick up the new key
+	s.cache.del(input.ClientID, input.Provider)
 
 	return stored, input.APIKey, nil
 }
@@ -241,8 +358,27 @@ func (s *ProviderKeyService) GetDecryptedWithModels(ctx context.Context, clientI
 	if client == nil {
 		return "", nil, fmt.Errorf("client not found")
 	}
+	return s.GetDecryptedWithModelsForClient(ctx, client, provider)
+}
 
-	stored, err := s.keyRepo.Get(ctx, clientID, provider)
+// GetDecryptedWithModelsForClient is like GetDecryptedWithModels but accepts
+// an already-fetched *Client to avoid a redundant lookup when the caller
+// already has the client (e.g., from AuthMiddleware).
+// Results are cached in-memory for 5 minutes to skip the DB query and
+// AES-GCM decryption on subsequent requests.
+//
+// The cache and DB both use client.ID (the internal UUID) since the
+// client_provider_keys table references clients(id), not clients(client_id).
+func (s *ProviderKeyService) GetDecryptedWithModelsForClient(ctx context.Context, client *Client, provider string) (string, []string, error) {
+	clientUUID := client.ID
+
+	// Fast path: check cache first
+	if apiKey, models, ok := s.cache.get(clientUUID, provider); ok {
+		return apiKey, models, nil
+	}
+
+	// Slow path: query database
+	stored, err := s.keyRepo.Get(ctx, clientUUID, provider)
 	if err != nil {
 		return "", nil, err
 	}
@@ -255,17 +391,23 @@ func (s *ProviderKeyService) GetDecryptedWithModels(ctx context.Context, clientI
 		return "", nil, fmt.Errorf("decrypt provider key: %w", err)
 	}
 
-	// Return allowed models (nil = all allowed, empty slice sent as nil)
 	allowedModels := stored.Models
 	if allowedModels == nil {
 		allowedModels = []string{}
 	}
+
+	// Populate cache
+	s.cache.set(clientUUID, provider, string(plain), allowedModels)
 	return string(plain), allowedModels, nil
 }
 
-// Delete removes a provider key for a client.
+// Delete removes a provider key for a client. Invalidates cache.
 func (s *ProviderKeyService) Delete(ctx context.Context, clientID, provider string) error {
-	return s.keyRepo.Delete(ctx, clientID, provider)
+	if err := s.keyRepo.Delete(ctx, clientID, provider); err != nil {
+		return err
+	}
+	s.cache.del(clientID, provider)
+	return nil
 }
 
 // List returns the public list of provider keys for a client (no secrets).
@@ -273,7 +415,11 @@ func (s *ProviderKeyService) List(ctx context.Context, clientID string) ([]Clien
 	return s.keyRepo.List(ctx, clientID)
 }
 
-// DeleteAllForClient removes all provider keys when a client is deleted.
+// DeleteAllForClient removes all provider keys when a client is deleted. Invalidates cache.
 func (s *ProviderKeyService) DeleteAllForClient(ctx context.Context, clientID string) error {
-	return s.keyRepo.DeleteAllForClient(ctx, clientID)
+	if err := s.keyRepo.DeleteAllForClient(ctx, clientID); err != nil {
+		return err
+	}
+	s.cache.delAllForClient(clientID)
+	return nil
 }

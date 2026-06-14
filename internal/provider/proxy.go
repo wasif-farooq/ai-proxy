@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/http2"
+
 	"ai-proxy/internal/client"
 	"ai-proxy/internal/logger"
 )
@@ -30,15 +32,22 @@ var sseBufPool = sync.Pool{
 }
 
 // NewProxy creates a proxy with a configurable HTTP client.
+// The transport is configured for HTTP/2 (h2c) to support multiplexing
+// over upstream connections, reducing per-request latency.
 func NewProxy(registry *Registry, providerKeySvc *client.ProviderKeyService, timeout time.Duration) *Proxy {
+	transport := &http.Transport{
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	// Enable HTTP/2 for upstream connections (most AI providers support it)
+	if err := http2.ConfigureTransport(transport); err != nil {
+		slog.Warn("failed to configure HTTP/2 transport", slog.String("error", err.Error()))
+	}
 	return &Proxy{
 		client: &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        200,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Timeout:   timeout,
+			Transport: transport,
 		},
 		registry:       registry,
 		providerKeySvc: providerKeySvc,
@@ -119,11 +128,11 @@ func (p *Proxy) Forward(ctx context.Context, providerID ProviderID, model string
 // allowed by the per-client key's model restrictions.
 func (p *Proxy) resolveAPIKey(ctx context.Context, prov *Provider, providerID ProviderID, model string) (string, error) {
 	apiKey := prov.APIKey
-	if clientID := extractClientID(ctx); clientID != "" {
-		clientKey, allowedModels, err := p.providerKeySvc.GetDecryptedWithModels(ctx, clientID, string(providerID))
+	if cl := extractClient(ctx); cl != nil {
+		clientKey, allowedModels, err := p.providerKeySvc.GetDecryptedWithModelsForClient(ctx, cl, string(providerID))
 		if err != nil {
 			logger.FromContext(ctx).Warn("failed to resolve per-client provider key, falling back to global",
-				slog.String(logger.KeyClientID, clientID),
+				slog.String(logger.KeyClientID, cl.ClientID),
 				slog.String(logger.KeyProviderID, string(providerID)),
 				slog.String("error", err.Error()),
 			)
@@ -143,7 +152,7 @@ func (p *Proxy) resolveAPIKey(ctx context.Context, prov *Provider, providerID Pr
 			}
 			apiKey = clientKey
 			logger.FromContext(ctx).Debug("using per-client provider key",
-				slog.String(logger.KeyClientID, clientID),
+				slog.String(logger.KeyClientID, cl.ClientID),
 				slog.String(logger.KeyProviderID, string(providerID)),
 			)
 		}
@@ -225,5 +234,16 @@ func extractClientID(ctx context.Context) string {
 	return ""
 }
 
+// extractClient extracts the full *Client from the context (set by AuthMiddleware).
+func extractClient(ctx context.Context) *client.Client {
+	if cl, ok := ctx.Value(clientKey{}).(*client.Client); ok {
+		return cl
+	}
+	return nil
+}
+
 // clientIDKey is a context key type to avoid collisions.
 type clientIDKey struct{}
+
+// clientKey is a context key type for the full *Client value.
+type clientKey struct{}

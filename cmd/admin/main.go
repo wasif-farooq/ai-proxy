@@ -15,81 +15,46 @@ import (
 
 	"ai-proxy/internal/admin"
 	"ai-proxy/internal/audit"
-	"ai-proxy/internal/client"
-	"ai-proxy/internal/config"
-	"ai-proxy/internal/database"
-	"ai-proxy/internal/logger"
-	"ai-proxy/internal/provider"
+	"ai-proxy/internal/bootstrap"
 	"ai-proxy/internal/shared"
 )
 
 func main() {
-	// Load configuration
-	cfg := config.Load()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	// Allow admin server to run on a different port
+	deps, err := bootstrap.Init(ctx)
+	if err != nil {
+		slog.Error("bootstrap failed", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	defer deps.DB.Close()
+
+	// Allow admin server to run on a different port via ADMIN_PORT
 	if port := os.Getenv("ADMIN_PORT"); port != "" {
 		if p, err := strconv.Atoi(port); err == nil {
-			cfg.ServerPort = p
+			deps.Cfg.ServerPort = p
 		}
 	}
 
-	// Initialise structured logging
-	logger.Init(logger.Config{
-		Level:     cfg.LogLevel,
-		Format:    cfg.LogFormat,
-		AddSource: cfg.IsDevelopment(),
-	})
-	slog.Info("starting admin server", slog.String("env", cfg.Env), slog.String("addr", cfg.Addr()))
-
-	// Connect to database
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	pool, err := database.Connect(ctx, cfg)
-	if err != nil {
-		slog.Error("failed to connect to database", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-	defer pool.Close()
-	slog.Info("database connection established")
-
-	// Initialise repositories
-	clientRepo := client.NewPostgresRepository(pool)
-	clientSvc := client.NewService(clientRepo, cfg.EncryptionKey)
-	providerRepo := provider.NewPostgresRepository(pool)
-	providerReg := provider.NewRegistry(providerRepo)
-	auditRepo := audit.NewPostgresRepository(pool)
-	auditSvc := audit.NewService(auditRepo)
-
-	// Initialise provider key service
-	providerKeyRepo := client.NewClientProviderKeyRepository(pool)
-	providerKeySvc := client.NewProviderKeyService(providerKeyRepo, clientSvc, cfg.EncryptionKey)
-
-	// Refresh provider registry
-	if err := providerReg.Refresh(ctx); err != nil {
-		slog.Warn("failed to refresh provider registry", slog.String("error", err.Error()))
-	}
-
-	// Create Gin router
-	router := shared.NewRouter(cfg)
-
-	// WebSocket hub for live connections — must be created before admin routes
-	// so the audit middleware can broadcast events to connected clients.
+	// ─── Admin-specific setup ─────────────────────────────
+	router := shared.NewRouter(deps.Cfg)
 	wsHub := admin.NewHub()
 
-	// Create admin handler and register routes with audit middleware
-	// that broadcasts each audit event to WebSocket clients in real time.
-	adminHandler := admin.NewHandler(cfg, pool, clientSvc, clientRepo, providerKeySvc, providerRepo, providerReg, auditRepo, auditSvc)
+	adminHandler := admin.NewHandler(
+		deps.Cfg, deps.DB, deps.ClientSvc, deps.ClientRepo,
+		deps.ProviderKeySvc, deps.ProviderRepo, deps.ProviderReg,
+		deps.AuditRepo, deps.AuditSvc,
+	)
 	adminGroup := router.Group("/api/v1/admin")
-	adminGroup.Use(audit.Middleware(auditSvc, wsHub))
-	adminHandler.RegisterRoutes(adminGroup, cfg.JWTSecret)
+	adminGroup.Use(audit.Middleware(deps.AuditSvc, wsHub))
+	adminHandler.RegisterRoutes(adminGroup, deps.Cfg.JWTSecret)
 
-	// WebSocket endpoint for live audit events
 	router.GET("/api/v1/admin/ws/connections", func(c *gin.Context) {
 		wsHub.HandleWebSocket(c)
 	})
 
-	// Serve frontend static assets (always in dev, required in prod)
+	// Serve frontend static assets
 	if _, err := os.Stat("./web/dist/index.html"); err == nil {
 		router.Static("/assets", "./web/dist/assets")
 		router.StaticFile("/", "./web/dist/index.html")
@@ -98,42 +63,39 @@ func main() {
 		})
 		slog.Info("serving frontend from ./web/dist")
 	} else {
-		slog.Warn("frontend build not found at ./web/dist — run 'make web-build' first", slog.String("error", err.Error()))
+		slog.Warn("frontend build not found at ./web/dist — run 'make web' first")
 	}
 
-	// Configure HTTP server
+	// ─── HTTP server ──────────────────────────────────────
 	srv := &http.Server{
-		Addr:         cfg.Addr(),
+		Addr:         deps.Cfg.Addr(),
 		Handler:      router,
-		ReadTimeout:  cfg.ServerReadTimeout,
-		WriteTimeout: cfg.ServerWriteTimeout,
+		ReadTimeout:  deps.Cfg.ServerReadTimeout,
+		WriteTimeout: deps.Cfg.ServerWriteTimeout,
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// Graceful shutdown
+	// ─── Graceful shutdown ────────────────────────────────
 	go func() {
 		quit := make(chan os.Signal, 1)
 		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-quit
 		slog.Info("shutting down admin server", slog.String("signal", sig.String()))
 
-		// Stop audit service (flush remaining events)
-		auditSvc.Stop()
-		clientSvc.Stop()
+		deps.AuditSvc.Stop()
+		deps.ClientSvc.Stop()
 
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		shutdownCtx, shutdownCancel := bootstrap.ShutdownCtx()
 		defer shutdownCancel()
-
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			slog.Error("server forced to shutdown", slog.String("error", err.Error()))
 		}
 	}()
 
-	slog.Info("admin server listening", slog.String("addr", cfg.Addr()))
+	slog.Info("admin server listening", slog.String("addr", deps.Cfg.Addr()))
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("admin server error", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-
 	slog.Info("admin server stopped gracefully")
 }

@@ -1,0 +1,35 @@
+# =============================================================================
+# Air — Live-reload configuration for ai-proxy development
+#
+# Usage:
+#   air                          # Reloads api server on Go file changes
+#   air -c .air.toml             # Same, explicit config
+#   SERVICE=admin air            # Reloads admin server instead
+# =============================================================================
+root = "."
+tmp_dir = "/tmp/air"
+
+[build]
+  # Use SERVICE env var to pick which server to build (default: api)
+  bin = "/tmp/air/{{ .MatchedBuildName }}"
+  cmd = """
+    go build \
+      -ldflags="-s -w" \
+      -o /tmp/air/{{ .MatchedBuildName }} \
+      ./cmd/{{ or .MatchedBuildName "api" }}
+  """
+  include_ext = ["go"]
+  exclude_dir = ["web", "test", "deployments", "build", "tmp", "vendor"]
+  exclude_regex = [".*_test.go", ".*_stress_test.go"]
+  include_dir = ["cmd", "internal"]
+  delay = 100
+
+[log]
+  main_only = true
+  time = true
+
+[color]
+  main = "magenta"
+  watcher = "cyan"
+  build = "yellow"
+  runner = "green"
